@@ -399,24 +399,7 @@ export function generateAndDownloadReport(
     });
   };
 
-  // const linkBlock = (url: string, index: number) => {
-  //   const wrapped = pdf.splitTextToSize(
-  //     `${index}. ${url}`,
-  //     pageWidth - marginX * 2
-  //   );
 
-  //   wrapped.forEach((line: string, i: number) => {
-  //     addPageIfNeeded();
-  //     if (i === 0) {
-  //       pdf.setTextColor(0, 0, 200);
-  //       pdf.textWithLink(line, marginX, y, { url });
-  //       pdf.setTextColor(0, 0, 0);
-  //     } else {
-  //       pdf.text(line, marginX + 5, y);
-  //     }
-  //     y += lineHeight;
-  //   });
-  // };
   const linkBlock = (url: string, index: number) => {
   addPageIfNeeded();
 

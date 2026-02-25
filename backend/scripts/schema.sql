@@ -17,6 +17,7 @@ CREATE TABLE users (
 );
 
 -- DOCUMENTS TABLE
+-- DOCUMENTS TABLE
 DROP TABLE IF EXISTS documents CASCADE;
 
 CREATE TABLE documents (
@@ -24,6 +25,9 @@ CREATE TABLE documents (
     user_id TEXT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
     file_name TEXT NOT NULL,
     file_path TEXT NOT NULL,
+    content_type TEXT,  -- ✅ Added
+    size INTEGER,       -- ✅ Added
+    extracted_text TEXT, -- ✅ Added (Used in analysis)
     upload_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -42,7 +46,9 @@ CREATE TABLE analysis_results (
 
 
 
-
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS content_type TEXT;
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS size INTEGER;
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS extracted_text TEXT;
 
 
 

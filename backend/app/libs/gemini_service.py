@@ -278,69 +278,358 @@
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# import os
+# import mimetypes
+# import asyncio
+# import tempfile
+# import shutil
+# import hashlib
+# import logging
+# import unicodedata
+# from typing import Optional, List
+
+# import pdfplumber
+# from pydantic import BaseModel
+# from google import genai
+# from google.genai.errors import APIError
+# from dotenv import load_dotenv
+
+# # =========================
+# # ENV & CONFIG
+# # =========================
+# load_dotenv()
+
+# GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+# GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+# PDF_MAX_PAGES = int(os.getenv("PDF_MAX_PAGES", 10))
+# PDF_RENDER_DPI = int(os.getenv("PDF_RENDER_DPI", 150))
+
+# # =========================
+# # LOGGING
+# # =========================
+# logging.basicConfig(
+#     level=logging.INFO,
+#     format="%(asctime)s [%(levelname)s] %(message)s",
+#     encoding="utf-8",
+# )
+# logger = logging.getLogger(__name__)
+
+# # =========================
+# # GEMINI CLIENT (SAFE INIT)
+# # =========================
+# if not GEMINI_API_KEY:
+#     logger.error("GEMINI_API_KEY not set")
+#     client = None
+# else:
+#     try:
+#         client = genai.Client(api_key=GEMINI_API_KEY)
+#     except Exception as e:
+#         logger.error("Failed to initialize Gemini client: %s", e)
+#         client = None
+
+# # =========================
+# # RESPONSE MODEL
+# # =========================
+# class TextExtractionResult(BaseModel):
+#     extracted_text: str
+
+# # =========================
+# # SIMPLE IN-MEMORY CACHE
+# # =========================
+# _GEMINI_CACHE: dict[str, str] = {}
+
+# # =========================
+# # HELPERS
+# # =========================
+# def _hash_file(path: str) -> str:
+#     h = hashlib.sha256()
+#     with open(path, "rb") as f:
+#         for chunk in iter(lambda: f.read(8192), b""):
+#             h.update(chunk)
+#     return h.hexdigest()
+
+# def _normalize_text(text: str) -> str:
+#     try:
+#         return (
+#             unicodedata.normalize("NFKD", text)
+#             .encode("ascii", "ignore")
+#             .decode("ascii")
+#         )
+#     except Exception:
+#         return text
+
+# def _extract_json_from_response(response_text: str) -> Optional[str]:
+#     text = response_text.strip()
+#     start = text.find("{")
+#     if start == -1:
+#         return None
+
+#     brace_count = 0
+#     for i, ch in enumerate(text[start:], start=start):
+#         if ch == "{":
+#             brace_count += 1
+#         elif ch == "}":
+#             brace_count -= 1
+#             if brace_count == 0:
+#                 candidate = text[start : i + 1]
+#                 try:
+#                     TextExtractionResult.model_validate_json(candidate)
+#                     return candidate
+#                 except Exception:
+#                     return None
+#     return None
+
+# def _pdf_to_images_sync(file_path: str) -> List[str]:
+#     temp_dir = tempfile.mkdtemp()
+#     image_paths: List[str] = []
+
+#     try:
+#         with pdfplumber.open(file_path) as pdf:
+#             for i, page in enumerate(pdf.pages[:PDF_MAX_PAGES]):
+#                 try:
+#                     img = page.to_image(resolution=PDF_RENDER_DPI).original
+#                     out = os.path.join(temp_dir, f"page_{i+1}.png")
+#                     img.save(out, "PNG")
+#                     image_paths.append(out)
+#                 except Exception as e:
+#                     logger.warning("PDF page %d failed: %s", i + 1, e)
+#     except Exception as e:
+#         logger.error("PDF processing failed: %s", e)
+
+#     return image_paths
+
+# # =========================
+# # CORE FUNCTION
+# # =========================
+# async def extract_text_with_gemini(file_path: str, is_pdf: bool) -> str:
+#     if not client:
+#         return "ERROR: Gemini client not initialized"
+
+#     if not os.path.exists(file_path):
+#         return "ERROR: File not found"
+
+#     mime_type, _ = mimetypes.guess_type(file_path)
+#     if not mime_type:
+#         return "ERROR: Unknown file type"
+
+#     if is_pdf and mime_type != "application/pdf":
+#         return f"ERROR: Expected PDF, got {mime_type}"
+#     if not is_pdf and mime_type not in ("image/png", "image/jpeg"):
+#         return f"ERROR: Unsupported image type {mime_type}"
+
+#     # =========================
+#     # CACHE CHECK
+#     # =========================
+#     file_hash = _hash_file(file_path)
+#     if file_hash in _GEMINI_CACHE:
+#         logger.info("Gemini cache hit")
+#         return _GEMINI_CACHE[file_hash]
+
+#     uploaded_files = []
+#     temp_paths = []
+
+#     try:
+#         # =========================
+#         # PREP INPUT FILES
+#         # =========================
+#         if is_pdf:
+#             temp_paths = await asyncio.to_thread(
+#                 _pdf_to_images_sync, file_path
+#             )
+#             if not temp_paths:
+#                 return "ERROR: PDF conversion failed"
+
+#             for img in temp_paths:
+#                 uploaded_files.append(client.files.upload(file=img))
+#         else:
+#             uploaded_files.append(client.files.upload(file=file_path))
+
+#         # =========================
+#         # SINGLE GEMINI CALL
+#         # =========================
+#         prompt = (
+#             "You are an expert document intelligence system. "
+#             "Extract ALL readable text accurately. Preserve order. "
+#             "Return ONLY valid JSON: "
+#             '{ "extracted_text": "..." }'
+#         )
+
+#         response = client.models.generate_content(
+#             model=GEMINI_MODEL,
+#             contents=[prompt, *uploaded_files],
+#             config={
+#                 "response_mime_type": "application/json",
+#                 "response_schema": TextExtractionResult,
+#             },
+#         )
+
+#         json_str = _extract_json_from_response(response.text)
+#         if not json_str:
+#             return f"ERROR: Invalid Gemini JSON response: {response.text[:200]}"
+
+#         result = TextExtractionResult.model_validate_json(json_str)
+#         clean_text = _normalize_text(result.extracted_text)
+
+#         _GEMINI_CACHE[file_hash] = clean_text
+#         return clean_text
+
+#     except APIError as e:
+#         logger.error("Gemini API error: %s", e)
+#         return "ERROR: Gemini API failed"
+
+#     except Exception as e:
+#         logger.error("Unexpected Gemini failure: %s", e)
+#         return "ERROR: Gemini processing failed"
+
+#     finally:
+#         # =========================
+#         # CLEANUP
+#         # =========================
+#         for f in uploaded_files:
+#             try:
+#                 client.files.delete(name=f.name)
+#             except Exception:
+#                 pass
+
+#         if temp_paths:
+#             shutil.rmtree(os.path.dirname(temp_paths[0]), ignore_errors=True)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 import os
+import re
+import time
 import mimetypes
 import asyncio
-import tempfile
-import shutil
 import hashlib
 import logging
 import unicodedata
-from typing import Optional, List
+from typing import Optional
 
-import pdfplumber
 from pydantic import BaseModel
-from google import genai
-from google.genai.errors import APIError
 from dotenv import load_dotenv
 
-# =========================
-# ENV & CONFIG
-# =========================
 load_dotenv()
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-PDF_MAX_PAGES = int(os.getenv("PDF_MAX_PAGES", 10))
-PDF_RENDER_DPI = int(os.getenv("PDF_RENDER_DPI", 150))
+GEMINI_API_KEY        = os.getenv("GEMINI_API_KEY")
+GEMINI_MODEL          = os.getenv("GEMINI_MODEL",          "gemini-2.0-flash")
+GEMINI_FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-2.0-flash-lite")
+GEMINI_MAX_RETRIES    = int(os.getenv("GEMINI_MAX_RETRIES", "2"))
+GEMINI_RETRY_DELAY    = int(os.getenv("GEMINI_RETRY_DELAY", "60"))
 
-# =========================
-# LOGGING
-# =========================
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    encoding="utf-8",
-)
 logger = logging.getLogger(__name__)
 
-# =========================
-# GEMINI CLIENT (SAFE INIT)
-# =========================
-if not GEMINI_API_KEY:
-    logger.error("GEMINI_API_KEY not set")
-    client = None
-else:
-    try:
-        client = genai.Client(api_key=GEMINI_API_KEY)
-    except Exception as e:
-        logger.error("Failed to initialize Gemini client: %s", e)
-        client = None
 
-# =========================
-# RESPONSE MODEL
-# =========================
 class TextExtractionResult(BaseModel):
     extracted_text: str
 
-# =========================
-# SIMPLE IN-MEMORY CACHE
-# =========================
+
 _GEMINI_CACHE: dict[str, str] = {}
 
-# =========================
-# HELPERS
-# =========================
+# -------------------------------------------------------
+# Init client — temporarily remove GOOGLE_API_KEY so the
+# Google AI SDK doesn't override our explicit api_key arg.
+# -------------------------------------------------------
+_google_key_backup = os.environ.pop("GOOGLE_API_KEY", None)
+
+client = None
+_genai_available = False
+
+if not GEMINI_API_KEY:
+    logger.warning("GEMINI_API_KEY not set — Gemini OCR disabled (local OCR will be used)")
+else:
+    try:
+        from google import genai as _genai
+        client = _genai.Client(api_key=GEMINI_API_KEY)
+        _genai_available = True
+        logger.info(
+            "Gemini client ready (primary=%s, fallback=%s)",
+            GEMINI_MODEL, GEMINI_FALLBACK_MODEL
+        )
+    except Exception as e:
+        logger.error("Gemini client init failed: %s", e)
+
+if _google_key_backup is not None:
+    os.environ["GOOGLE_API_KEY"] = _google_key_backup
+
+# MIME types Gemini Files API accepts directly
+GEMINI_SUPPORTED_MIMES = {
+    "application/pdf",
+    "application/msword",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "text/plain",
+    "image/png",
+    "image/jpeg",
+    "image/webp",
+    "image/gif",
+    "image/heic",
+    "image/heif",
+}
+
+_EXT_MIME = {
+    ".pdf":  "application/pdf",
+    ".doc":  "application/msword",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".png":  "image/png",
+    ".jpg":  "image/jpeg",
+    ".jpeg": "image/jpeg",
+}
+
+
+# -------------------------------------------------------
+# Helpers
+# -------------------------------------------------------
 def _hash_file(path: str) -> str:
     h = hashlib.sha256()
     with open(path, "rb") as f:
@@ -348,29 +637,34 @@ def _hash_file(path: str) -> str:
             h.update(chunk)
     return h.hexdigest()
 
-def _normalize_text(text: str) -> str:
+
+def _normalize(text: str) -> str:
     try:
-        return (
-            unicodedata.normalize("NFKD", text)
-            .encode("ascii", "ignore")
-            .decode("ascii")
-        )
+        return unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
     except Exception:
         return text
 
-def _extract_json_from_response(response_text: str) -> Optional[str]:
+
+def _parse_retry_delay(err: str) -> int:
+    m = re.search(r"retry in (\d+)", err)
+    return int(m.group(1)) + 5 if m else GEMINI_RETRY_DELAY
+
+
+def _parse_json(response_text: str) -> Optional[str]:
     text = response_text.strip()
+    if not text.startswith("{"):
+        safe = text.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+        return f'{{"extracted_text": "{safe}"}}'
     start = text.find("{")
     if start == -1:
         return None
-
-    brace_count = 0
-    for i, ch in enumerate(text[start:], start=start):
+    depth = 0
+    for i, ch in enumerate(text[start:], start):
         if ch == "{":
-            brace_count += 1
+            depth += 1
         elif ch == "}":
-            brace_count -= 1
-            if brace_count == 0:
+            depth -= 1
+            if depth == 0:
                 candidate = text[start : i + 1]
                 try:
                     TextExtractionResult.model_validate_json(candidate)
@@ -379,117 +673,123 @@ def _extract_json_from_response(response_text: str) -> Optional[str]:
                     return None
     return None
 
-def _pdf_to_images_sync(file_path: str) -> List[str]:
-    temp_dir = tempfile.mkdtemp()
-    image_paths: List[str] = []
 
-    try:
-        with pdfplumber.open(file_path) as pdf:
-            for i, page in enumerate(pdf.pages[:PDF_MAX_PAGES]):
-                try:
-                    img = page.to_image(resolution=PDF_RENDER_DPI).original
-                    out = os.path.join(temp_dir, f"page_{i+1}.png")
-                    img.save(out, "PNG")
-                    image_paths.append(out)
-                except Exception as e:
-                    logger.warning("PDF page %d failed: %s", i + 1, e)
-    except Exception as e:
-        logger.error("PDF processing failed: %s", e)
+def _call_gemini_sync(uploaded_file, model: str) -> Optional[str]:
+    """Synchronous Gemini call with per-minute retry and model fallback."""
+    models = [model]
+    if model != GEMINI_FALLBACK_MODEL:
+        models.append(GEMINI_FALLBACK_MODEL)
 
-    return image_paths
+    prompt = (
+        "Extract ALL readable text from the provided file accurately. "
+        "Preserve reading order. Include all text, numbers, tables, symbols. "
+        'Return ONLY valid JSON: { "extracted_text": "..." }'
+    )
 
-# =========================
-# CORE FUNCTION
-# =========================
-async def extract_text_with_gemini(file_path: str, is_pdf: bool) -> str:
-    if not client:
-        return "ERROR: Gemini client not initialized"
+    for current_model in models:
+        for attempt in range(1, GEMINI_MAX_RETRIES + 1):
+            try:
+                logger.info("Gemini: model=%s attempt=%d/%d", current_model, attempt, GEMINI_MAX_RETRIES)
+                resp = client.models.generate_content(
+                    model=current_model,
+                    contents=[prompt, uploaded_file],
+                    config={
+                        "response_mime_type": "application/json",
+                        "response_schema": TextExtractionResult,
+                    },
+                )
+                logger.info("Gemini success (model=%s)", current_model)
+                return resp.text
+
+            except Exception as e:
+                err = str(e)
+                if "404" in err or "NOT_FOUND" in err:
+                    logger.error("Model %s not found — trying next", current_model)
+                    break
+                if "429" in err or "RESOURCE_EXHAUSTED" in err:
+                    wait = _parse_retry_delay(err)
+                    if attempt < GEMINI_MAX_RETRIES:
+                        logger.warning("Gemini 429 on %s (attempt %d/%d) — waiting %ds",
+                                       current_model, attempt, GEMINI_MAX_RETRIES, wait)
+                        time.sleep(wait)
+                        continue
+                    logger.warning("Quota exhausted on %s after %d attempts — trying next model",
+                                   current_model, GEMINI_MAX_RETRIES)
+                    break
+                # auth error, network, invalid file — don't retry
+                logger.error("Gemini non-retryable error (model=%s): %s", current_model, err[:200])
+                return None
+
+    logger.error("All Gemini models exhausted: %s", models)
+    return None
+
+
+# -------------------------------------------------------
+# Public API
+# -------------------------------------------------------
+async def extract_text_with_gemini(file_path: str, is_pdf: bool = False) -> str:
+    """
+    Gemini OCR fallback. Called only when local extraction fails.
+    Always returns str ("" on any failure).
+    `is_pdf` is kept for backward compatibility but ignored —
+    PDFs are uploaded directly as application/pdf.
+    """
+    if not _genai_available or not client:
+        logger.warning("Gemini unavailable — local OCR should have handled this")
+        return ""
 
     if not os.path.exists(file_path):
-        return "ERROR: File not found"
+        return ""
 
+    ext = os.path.splitext(file_path)[1].lower()
     mime_type, _ = mimetypes.guess_type(file_path)
     if not mime_type:
-        return "ERROR: Unknown file type"
+        mime_type = _EXT_MIME.get(ext)
 
-    if is_pdf and mime_type != "application/pdf":
-        return f"ERROR: Expected PDF, got {mime_type}"
-    if not is_pdf and mime_type not in ("image/png", "image/jpeg"):
-        return f"ERROR: Unsupported image type {mime_type}"
+    if not mime_type or mime_type not in GEMINI_SUPPORTED_MIMES:
+        logger.warning("Unsupported MIME for Gemini: %s (%s)", mime_type, file_path)
+        return ""
 
-    # =========================
-    # CACHE CHECK
-    # =========================
-    file_hash = _hash_file(file_path)
-    if file_hash in _GEMINI_CACHE:
-        logger.info("Gemini cache hit")
-        return _GEMINI_CACHE[file_hash]
-
-    uploaded_files = []
-    temp_paths = []
-
+    # Cache
+    file_hash = None
     try:
-        # =========================
-        # PREP INPUT FILES
-        # =========================
-        if is_pdf:
-            temp_paths = await asyncio.to_thread(
-                _pdf_to_images_sync, file_path
-            )
-            if not temp_paths:
-                return "ERROR: PDF conversion failed"
+        file_hash = _hash_file(file_path)
+        if file_hash in _GEMINI_CACHE:
+            logger.info("Gemini cache hit: %s", file_path)
+            return _GEMINI_CACHE[file_hash]
+    except Exception:
+        pass
 
-            for img in temp_paths:
-                uploaded_files.append(client.files.upload(file=img))
-        else:
-            uploaded_files.append(client.files.upload(file=file_path))
+    uploaded_file = None
+    try:
+        logger.info("Gemini fallback upload: %s (mime=%s)", os.path.basename(file_path), mime_type)
+        uploaded_file = client.files.upload(file=file_path)
 
-        # =========================
-        # SINGLE GEMINI CALL
-        # =========================
-        prompt = (
-            "You are an expert document intelligence system. "
-            "Extract ALL readable text accurately. Preserve order. "
-            "Return ONLY valid JSON: "
-            '{ "extracted_text": "..." }'
-        )
+        response_text = await asyncio.to_thread(_call_gemini_sync, uploaded_file, GEMINI_MODEL)
+        if not response_text:
+            return ""
 
-        response = client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=[prompt, *uploaded_files],
-            config={
-                "response_mime_type": "application/json",
-                "response_schema": TextExtractionResult,
-            },
-        )
-
-        json_str = _extract_json_from_response(response.text)
+        json_str = _parse_json(response_text)
         if not json_str:
-            return f"ERROR: Invalid Gemini JSON response: {response.text[:200]}"
+            logger.error("Bad Gemini JSON for %s: %s", file_path, response_text[:150])
+            return ""
 
         result = TextExtractionResult.model_validate_json(json_str)
-        clean_text = _normalize_text(result.extracted_text)
+        clean = _normalize(result.extracted_text)
 
-        _GEMINI_CACHE[file_hash] = clean_text
-        return clean_text
+        if file_hash and clean:
+            _GEMINI_CACHE[file_hash] = clean
 
-    except APIError as e:
-        logger.error("Gemini API error: %s", e)
-        return "ERROR: Gemini API failed"
+        logger.info("Gemini fallback success: %s (%d chars)", os.path.basename(file_path), len(clean))
+        return clean
 
     except Exception as e:
-        logger.error("Unexpected Gemini failure: %s", e)
-        return "ERROR: Gemini processing failed"
+        logger.error("Gemini fallback error for %s: %s", file_path, e)
+        return ""
 
     finally:
-        # =========================
-        # CLEANUP
-        # =========================
-        for f in uploaded_files:
+        if uploaded_file:
             try:
-                client.files.delete(name=f.name)
+                client.files.delete(name=uploaded_file.name)
             except Exception:
                 pass
-
-        if temp_paths:
-            shutil.rmtree(os.path.dirname(temp_paths[0]), ignore_errors=True)

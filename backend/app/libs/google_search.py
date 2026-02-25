@@ -178,6 +178,327 @@
 
 
 
+#  # backend/app/libs/google_search.py
+
+# import time
+# import random
+# import requests
+# from typing import List
+# from urllib.parse import quote_plus
+
+# from app.env import GOOGLE_API_KEY, GOOGLE_CSE_ID
+
+# MAX_RESULTS = 8
+# MIN_QUERY_WORDS = 6
+# REQUEST_TIMEOUT = 8
+# REQUEST_DELAY_RANGE = (0.3, 0.8)
+
+
+# def build_search_queries(text: str) -> List[str]:
+#     words = text.split()
+#     if len(words) < MIN_QUERY_WORDS:
+#         return []
+
+#     queries = [
+#         " ".join(words[:12]),
+#         " ".join(words[len(words)//2:len(words)//2 + 12]),
+#         " ".join(words[-12:]),
+#     ]
+
+#     seed = hash(text[:200])
+#     rng = random.Random(seed)
+#     start = rng.randint(0, max(0, len(words) - 12))
+#     queries.append(" ".join(words[start:start + 12]))
+
+#     return list(dict.fromkeys(q.strip() for q in queries if q.strip()))
+
+
+# def google_search(text: str) -> List[str]:
+#     """
+#     LEGAL NOTE:
+#     - Uses Google Custom Search JSON API
+#     - No HTML scraping
+#     - Fully ToS compliant
+#     """
+
+#     if not GOOGLE_API_KEY or not GOOGLE_CSE_ID:
+#         return []
+
+#     queries = build_search_queries(text)
+#     collected_urls: List[str] = []
+
+#     for query in queries:
+#         url = (
+#             "https://www.googleapis.com/customsearch/v1"
+#             f"?key={GOOGLE_API_KEY}"
+#             f"&cx={GOOGLE_CSE_ID}"
+#             f"&q={quote_plus(query)}"
+#             f"&num=5"
+#         )
+
+#         try:
+#             r = requests.get(url, timeout=REQUEST_TIMEOUT)
+#             if r.status_code != 200:
+#                 continue
+
+#             for item in r.json().get("items", []):
+#                 link = item.get("link")
+#                 if link and link not in collected_urls:
+#                     collected_urls.append(link)
+
+#         except Exception:
+#             continue
+
+#         time.sleep(random.uniform(*REQUEST_DELAY_RANGE))
+
+#         if len(collected_urls) >= MAX_RESULTS:
+#             break
+
+#     return collected_urls[:MAX_RESULTS]
+
+
+################################################################################## above is main imp
+
+
+
+
+
+
+
+
+
+
+# # backend/app/libs/google_search.py
+
+# import time
+# import random
+# import requests
+# from typing import List
+# from urllib.parse import quote_plus
+
+# from app.env import GOOGLE_API_KEY, GOOGLE_CSE_ID
+
+# MAX_RESULTS = 8
+# MIN_QUERY_WORDS = 6
+# REQUEST_TIMEOUT = 8
+# REQUEST_DELAY_RANGE = (0.3, 0.8)
+
+
+
+
+# def normalize_for_search(text: str, max_words: int = 120) -> str:
+#     """
+#     Normalizes extracted text for reliable Google search queries.
+#     Removes numbers, short tokens, and symbols.
+#     """
+#     words = [
+#         w for w in re.split(r"\W+", text.lower())
+#         if len(w) > 3 and not w.isdigit()
+#     ]
+#     return " ".join(words[:max_words])
+
+
+
+
+
+
+# def build_search_queries(text: str) -> List[str]:
+#     words = text.split()
+#     if len(words) < 10:
+#         return []
+
+#     queries = [
+#         " ".join(words[:15]),
+#         " ".join(words[len(words)//2 : len(words)//2 + 15]),
+#         " ".join(words[-15:]),
+#     ]
+
+#     return list(dict.fromkeys(q for q in queries if len(q.split()) >= 6))
+
+
+
+
+
+# def google_search(text: str) -> List[str]:
+#     """
+#     Uses Google Custom Search JSON API (ToS compliant)
+#     Forces HTML results (not PDFs)
+#     """
+
+#     if not GOOGLE_API_KEY or not GOOGLE_CSE_ID:
+#         return []
+
+#     queries = build_search_queries(text)
+#     collected_urls: List[str] = []
+
+#     for query in queries:
+#         url = (
+#             "https://www.googleapis.com/customsearch/v1"
+#             f"?key={GOOGLE_API_KEY}"
+#             f"&cx={GOOGLE_CSE_ID}"
+#             f"&q={quote_plus(query)}"
+#             f"&num=5"
+#             f"&fileType=html"
+#             f"&excludeTerms=pdf doc ppt xls"
+#         )
+
+#         try:
+#             r = requests.get(url, timeout=REQUEST_TIMEOUT)
+#             if r.status_code != 200:
+#                 continue
+
+#             for item in r.json().get("items", []):
+#                 link = item.get("link")
+#                 if link and link not in collected_urls:
+#                     collected_urls.append(link)
+
+#         except Exception:
+#             continue
+
+#         time.sleep(random.uniform(*REQUEST_DELAY_RANGE))
+
+#         if len(collected_urls) >= MAX_RESULTS:
+#             break
+
+#     return collected_urls[:MAX_RESULTS]
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# import time
+# import random
+# import requests
+# import re
+# from typing import List
+# from urllib.parse import quote_plus
+
+# from app.env import GOOGLE_API_KEY, GOOGLE_CSE_ID
+
+# MAX_RESULTS = 8
+# REQUEST_TIMEOUT = 8
+# REQUEST_DELAY_RANGE = (0.4, 0.9)
+
+
+# def normalize_for_search(text: str, max_words: int = 120) -> str:
+#     words = [
+#         w for w in re.split(r"\W+", text.lower())
+#         if len(w) > 3 and not w.isdigit()
+#     ]
+#     return " ".join(words[:max_words])
+
+
+# def google_search(text: str) -> List[str]:
+#     if not GOOGLE_API_KEY or not GOOGLE_CSE_ID:
+#         return []
+
+#     query = normalize_for_search(text)
+#     if len(query.split()) < 6:
+#         return []
+
+#     url = (
+#         "https://www.googleapis.com/customsearch/v1"
+#         f"?key={GOOGLE_API_KEY}"
+#         f"&cx={GOOGLE_CSE_ID}"
+#         f"&q={quote_plus(query)}"
+#         f"&num=5"
+#         f"&fileType=html"
+#         f"&excludeTerms=pdf doc ppt xls"
+#     )
+
+#     try:
+#         r = requests.get(url, timeout=REQUEST_TIMEOUT)
+#         if r.status_code != 200:
+#             return []
+
+#         links = []
+#         for item in r.json().get("items", []):
+#             link = item.get("link")
+#             if link and link not in links:
+#                 links.append(link)
+
+#         time.sleep(random.uniform(*REQUEST_DELAY_RANGE))
+#         return links[:MAX_RESULTS]
+
+#     except Exception:
+#         return []
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
  # backend/app/libs/google_search.py
 
 import time

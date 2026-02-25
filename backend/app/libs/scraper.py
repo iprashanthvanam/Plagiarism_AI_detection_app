@@ -189,6 +189,382 @@
 
 
 
+# import requests
+# from bs4 import BeautifulSoup
+# from typing import Optional
+# import re
+# from urllib.parse import urlparse
+# from urllib.robotparser import RobotFileParser
+
+# REQUEST_TIMEOUT = 8
+# MAX_TEXT_LENGTH = 50000
+
+# REMOVE_TAGS = {
+#     "script", "style", "nav", "footer", "header",
+#     "aside", "noscript", "svg", "iframe"
+# }
+
+# # Only scrape normal content sites
+# # BLOCKED_DOMAINS = {
+# #     "accounts.google.com",
+# #     "consent.google.com",
+# #     "login",
+# # }
+# BLOCKED_DOMAINS = {
+#     "accounts.google.com",
+#     "consent.google.com",
+# }
+
+# def is_blocked_domain(domain: str) -> bool:
+#     return any(domain == d or domain.endswith("." + d) for d in BLOCKED_DOMAINS)
+
+
+
+# def clean_text(text: str) -> str:
+#     return re.sub(r"\s+", " ", text).strip()
+
+
+# def is_boilerplate(text: str) -> bool:
+#     phrases = [
+#         "cookie policy",
+#         "privacy policy",
+#         "terms of service",
+#         "all rights reserved",
+#         "sign up",
+#         "log in",
+#     ]
+#     t = text.lower()
+#     return any(p in t for p in phrases)
+
+
+# def extract_text_from_url(url: str) -> Optional[str]:
+#     """
+#     LEGAL & STABILITY GUARANTEES:
+#     - No Google HTML scraping
+#     - No login / cookie walls
+#     - HTML only
+#     - Content-quality gated
+#     """
+
+#     try:
+#         domain = urlparse(url).netloc.lower()
+#         if is_blocked_domain(domain):
+#             return None
+
+#         headers = {
+#             "User-Agent": "AcademicPlagiarismBot/1.0 (+educational use)"
+#         }
+
+#         r = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+#         if r.status_code != 200:
+#             return None
+
+#         content_type = r.headers.get("Content-Type", "")
+#         if "text/html" not in content_type:
+#             return None
+
+#         soup = BeautifulSoup(r.text, "html.parser")
+
+#         for tag in soup.find_all(REMOVE_TAGS):
+#             tag.decompose()
+
+#         container = soup.find("article") or soup.body
+#         if not container:
+#             return None
+
+#         paragraphs = []
+#         seen = set()
+
+#         for p in container.find_all("p"):
+#             text = clean_text(p.get_text())
+#             if len(text) < 40 or text in seen:
+#                 continue
+
+#             seen.add(text)
+#             paragraphs.append(text)
+
+#             if sum(len(x) for x in paragraphs) > MAX_TEXT_LENGTH:
+#                 break
+
+#         combined = clean_text(" ".join(paragraphs))
+
+#         if not combined or is_boilerplate(combined):
+#             return None
+
+#         return combined
+
+#     except Exception:
+#         return None
+
+
+
+
+# def allowed_by_robots(url: str) -> bool:
+#     rp = RobotFileParser()
+#     rp.set_url(f"{urlparse(url).scheme}://{urlparse(url).netloc}/robots.txt")
+#     rp.read()
+#     return rp.can_fetch("*", url)
+
+#     if not allowed_by_robots(url):
+#         return None
+
+
+
+
+###############################################################################################################above is imp
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# # backend/app/libs/scraper.py
+# from typing import Optional
+# import re
+# import requests
+# from bs4 import BeautifulSoup
+# from urllib.parse import urlparse
+
+
+
+
+# def extract_text_from_url(url: str) -> Optional[str]:
+#     try:
+#         domain = urlparse(url).netloc.lower()
+#         if is_blocked_domain(domain):
+#             return None
+
+#         headers = {
+#             "User-Agent": "AcademicPlagiarismBot/1.0 (+educational use)"
+#         }
+
+#         r = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+#         if r.status_code != 200:
+#             return None
+
+#         content_type = r.headers.get("Content-Type", "").lower()
+#         if "text/html" not in content_type:
+#             return None
+
+#         soup = BeautifulSoup(r.text, "html.parser")
+
+#         for tag in soup.find_all(REMOVE_TAGS):
+#             tag.decompose()
+
+#         container = soup.find("article") or soup.body
+#         if not container:
+#             return None
+
+#         paragraphs = []
+#         seen = set()
+
+#         for p in container.find_all("p"):
+#             text = clean_text(p.get_text())
+#             if len(text) < 40 or text in seen:
+#                 continue
+
+#             seen.add(text)
+#             paragraphs.append(text)
+
+#             if sum(len(x) for x in paragraphs) > MAX_TEXT_LENGTH:
+#                 break
+
+#         combined = clean_text(" ".join(paragraphs))
+
+#         if not combined or is_boilerplate(combined):
+#             return None
+
+#         return combined
+
+#     except Exception:
+#         return None
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# import requests
+# from bs4 import BeautifulSoup
+# from typing import Optional
+# import re
+# from urllib.parse import urlparse
+
+# REQUEST_TIMEOUT = 8
+# MAX_TEXT_LENGTH = 50000
+
+# REMOVE_TAGS = {
+#     "script", "style", "nav", "footer", "header",
+#     "aside", "noscript", "svg", "iframe"
+# }
+
+# BLOCKED_DOMAINS = {
+#     "accounts.google.com",
+#     "consent.google.com",
+# }
+
+
+# def is_blocked_domain(domain: str) -> bool:
+#     return any(domain == d or domain.endswith("." + d) for d in BLOCKED_DOMAINS)
+
+
+# def clean_text(text: str) -> str:
+#     return re.sub(r"\s+", " ", text).strip()
+
+
+# def is_boilerplate(text: str) -> bool:
+#     phrases = [
+#         "cookie policy",
+#         "privacy policy",
+#         "terms of service",
+#         "all rights reserved",
+#         "sign up",
+#         "log in",
+#     ]
+#     t = text.lower()
+#     return any(p in t for p in phrases)
+
+
+# def extract_text_from_url(url: str) -> Optional[str]:
+#     """
+#     LEGAL & STABILITY GUARANTEES:
+#     - No Google HTML scraping
+#     - HTML only
+#     - Content-quality gated
+#     """
+
+#     try:
+#         domain = urlparse(url).netloc.lower()
+#         if is_blocked_domain(domain):
+#             return None
+
+#         headers = {
+#             "User-Agent": "AcademicPlagiarismBot/1.0 (+educational use)"
+#         }
+
+#         r = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+#         if r.status_code != 200:
+#             return None
+
+#         content_type = r.headers.get("Content-Type", "").lower()
+#         if "text/html" not in content_type:
+#             return None
+
+#         soup = BeautifulSoup(r.text, "html.parser")
+
+#         for tag in soup.find_all(REMOVE_TAGS):
+#             tag.decompose()
+
+#         container = soup.find("article") or soup.body
+#         if not container:
+#             return None
+
+#         paragraphs = []
+#         seen = set()
+
+#         for p in container.find_all("p"):
+#             text = clean_text(p.get_text())
+#             if len(text) < 40 or text in seen:
+#                 continue
+
+#             seen.add(text)
+#             paragraphs.append(text)
+
+#             if sum(len(x) for x in paragraphs) > MAX_TEXT_LENGTH:
+#                 break
+
+#         combined = clean_text(" ".join(paragraphs))
+
+#         if not combined or is_boilerplate(combined):
+#             return None
+
+#         return combined
+
+#     except Exception:
+#         return None
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 import requests
 from bs4 import BeautifulSoup
 from typing import Optional
@@ -307,7 +683,3 @@ def allowed_by_robots(url: str) -> bool:
 
     if not allowed_by_robots(url):
         return None
-
-
-
-

@@ -18,17 +18,12 @@ from app.env import SECRET_KEY, ALGORITHM
 from app.core.limitter import limiter
 
 
-# =========================
-# ROUTER
-# =========================
 router = APIRouter()
 
-# OAuth2 (Bearer token)
+
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
 
-# =========================
-# LOGIN
-# =========================
+
 @router.post("/login")
 @limiter.limit("5/minute")
 async def login(
@@ -40,7 +35,7 @@ async def login(
     if not user:
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
-    # JWT payload
+ 
     payload = {
         "sub": user["user_id"],       # INTERNAL ID (DB)
         "username": user["username"],# DISPLAY / LOGIN
@@ -57,9 +52,6 @@ async def login(
         "role": user["role"],
     }
 
-# =========================
-# CURRENT USER DEPENDENCY
-# =========================
 async def get_current_user(token: str = Depends(oauth2_scheme)):
     credentials_exception = HTTPException(
         status_code=401,

@@ -95,3 +95,49 @@ transformers
 google-genai
 
 slowapi
+
+
+
+# ============================================================
+# ADD THESE TO YOUR backend/requirements.txt
+# ============================================================
+
+# Local OCR for images and scanned PDFs (no quota, no API key needed)
+pytesseract>=0.3.10        # Python wrapper for Tesseract OCR engine
+Pillow>=10.0.0             # Image processing (required by pytesseract)
+pdf2image>=1.17.0          # Convert PDF pages to images for Tesseract
+
+# Local .doc extraction (legacy binary Word format)
+mammoth>=1.6.0             # Extracts raw text from .doc files cleanly
+
+# ============================================================
+# SYSTEM PACKAGES (install on your Ubuntu machine)
+# Run these once in terminal:
+# ============================================================
+#
+#   sudo apt-get update
+#   sudo apt-get install -y tesseract-ocr poppler-utils
+#
+# tesseract-ocr  → the actual Tesseract OCR engine (pytesseract needs this)
+# poppler-utils  → pdf2image needs this to render PDF pages (pdfinfo, pdftoppm)
+#
+# Verify installation:
+#   tesseract --version
+#   pdftoppm -h
+#
+# ============================================================
+# OPTIONAL: Additional language packs for Tesseract
+# (default is English only — add if your PDFs are in other languages)
+# ============================================================
+#   sudo apt-get install -y tesseract-ocr-hin   # Hindi
+#   sudo apt-get install -y tesseract-ocr-tel   # Telugu
+#   sudo apt-get install -y tesseract-ocr-tam   # Tamil
+#   sudo apt-get install -y tesseract-ocr-ben   # Bengali
+#   sudo apt-get install -y tesseract-ocr-mal   # Malayalam
+#   sudo apt-get install -y tesseract-ocr-guj   # Gujarati
+#   sudo apt-get install -y tesseract-ocr-kan   # Kannada
+#   sudo apt-get install -y tesseract-ocr-mar   # Marathi
+#   sudo apt-get install -y tesseract-ocr-ori   # Oriya
+#   sudo apt-get install -y tesseract-ocr-pun   # Punjabi
+#   sudo apt-get install -y tesseract-ocr-ben   # Bengali
+

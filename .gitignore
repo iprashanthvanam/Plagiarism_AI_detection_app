@@ -18,3 +18,8 @@ coverage/
 # --- System Files ---
 .DS_Store
 Thumbs.db
+
+
+
+
+ backend/HS256/
