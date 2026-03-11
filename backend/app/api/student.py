@@ -1,11 +1,6 @@
 
 
 
-
-
-
-
-
 from fastapi import APIRouter, Depends, HTTPException
 from app.libs.database import db_service
 from app.core.security import get_current_user

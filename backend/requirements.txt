@@ -141,3 +141,44 @@ mammoth>=1.6.0             # Extracts raw text from .doc files cleanly
 #   sudo apt-get install -y tesseract-ocr-pun   # Punjabi
 #   sudo apt-get install -y tesseract-ocr-ben   # Bengali
 
+
+
+
+# ============================================================
+# ADD THESE NEW LINES to your existing requirements.txt
+# (these are the only additions needed for the new plagiarism.py)
+# ============================================================
+
+# [B1] Sentence-BERT — semantic/paraphrasing detection
+# Downloads ~80MB model (all-MiniLM-L6-v2) on first run
+# Cached at ~/.cache/huggingface/ — no re-download after that
+sentence-transformers>=2.7.0
+
+# numpy is auto-installed by scikit-learn and torch, but pin here for clarity
+numpy>=1.24.0
+
+# ============================================================
+# ALL OTHER PACKAGES already exist in your requirements.txt:
+# ============================================================
+# scikit-learn   → used by A1 TF-IDF (TfidfVectorizer)
+# nltk           → tokenization (already present)
+# torch          → required by sentence-transformers (already present)
+# transformers   → required by sentence-transformers (already present)
+# ============================================================
+# NO SYSTEM PACKAGES NEEDED for the new methods
+# (Winnowing, Jaccard, Character N-gram = pure Python)
+# ============================================================
+
+
+
+
+# OCR — Primary (deep learning, multilingual)
+paddlepaddle
+paddleocr
+
+# PDF page rendering (required by PaddleOCR/Tesseract page-level fallback)
+pdf2image
+
+# OCR — Last resort fallback
+pytesseract
+Pillow
