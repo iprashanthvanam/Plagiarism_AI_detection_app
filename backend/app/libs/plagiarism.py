@@ -423,6 +423,10 @@
 
 #     Returns: (score 0.0-1.0, was_available: bool)
 #     was_available=False means SBERT is not installed — caller redistributes weight.
+
+#     NOTE: SBERT cosine between two academic papers on the SAME topic is typically
+#     0.60-0.75 even if they share no copied text (they just discuss the same ideas).
+#     The noise floor for SBERT is therefore 0.60 — scores below that are zeroed.
 #     """
 #     model = _get_sbert_model()
 #     if model is None:
@@ -433,7 +437,6 @@
 
 #     try:
 #         # Truncate very long documents — SBERT has 512 token limit
-#         # Use first 2000 chars (≈400 tokens) for speed on CPU
 #         src_text = source[:4000]
 #         tgt_texts = [t[:4000] for t in targets if t]
 
@@ -446,12 +449,9 @@
 #         src_emb  = embeddings[0]
 #         tgt_embs = embeddings[1:]
 
-#         # Cosine similarity with each target
 #         sims = [_cosine_np(src_emb, tgt) for tgt in tgt_embs]
 #         max_sim = max(sims) if sims else 0.0
 
-#         # SBERT cosine can be slightly negative for unrelated texts
-#         # Clamp to [0, 1]
 #         return float(max(0.0, max_sim)), True
 
 #     except Exception as e:
@@ -460,10 +460,8 @@
 
 
 # # ─────────────────────────────────────────────────────────────────────────────
-# # WEIGHTED ENSEMBLE SCORE
+# # WEIGHT REDISTRIBUTION (when SBERT unavailable)
 # # ─────────────────────────────────────────────────────────────────────────────
-# # Combines all methods with configurable weights.
-# # If SBERT is unavailable, its 15% weight redistributes proportionally.
 
 # def _redistribute_weights(weights: dict, skip_key: str) -> dict:
 #     """
@@ -480,91 +478,117 @@
 #     return {k: v * factor for k, v in remaining.items()}
 
 
+# # ─────────────────────────────────────────────────────────────────────────────
+# # WEIGHTED ENSEMBLE SCORE
+# # ─────────────────────────────────────────────────────────────────────────────
+
 # def ensemble_plagiarism_score(source: str, targets: List[str]) -> dict:
 #     """
-#     Run all 5 plagiarism detection methods and combine into a weighted score.
+#     Run all 5 plagiarism detection methods, apply noise floors, combine into
+#     a weighted score, and apply calibration curve to match Turnitin output.
 
 #     Returns a dict with:
-#       - 'score':     final ensemble score (0.0 – 100.0)
-#       - 'breakdown': per-method scores for explainability
-#       - 'methods':   which methods ran successfully
+#       - 'score':          final calibrated score (0.0 – 100.0)
+#       - 'raw_score':      pre-calibration ensemble score (for debugging)
+#       - 'breakdown':      per-method raw scores (before noise floor)
+#       - 'breakdown_adj':  per-method scores after noise floor removal
+#       - 'methods':        which methods ran successfully
 #     """
 #     if not source or not targets:
-#         return {"score": 0.0, "breakdown": {}, "methods": []}
+#         return {"score": 0.0, "raw_score": 0.0, "breakdown": {}, "breakdown_adj": {}, "methods": []}
 
-#     src_tokens  = normalize_text(source)
+#     src_tokens = normalize_text(source)
 #     if len(src_tokens) < MIN_TOKENS:
 #         logger.debug("Source too short (%d tokens) — skipping ensemble", len(src_tokens))
-#         return {"score": 0.0, "breakdown": {}, "methods": []}
+#         return {"score": 0.0, "raw_score": 0.0, "breakdown": {}, "breakdown_adj": {}, "methods": []}
 
 #     # Filter out targets that are too short
 #     valid_targets = [t for t in targets if len(normalize_text(t)) >= MIN_TOKENS]
 #     if not valid_targets:
-#         return {"score": 0.0, "breakdown": {}, "methods": []}
+#         return {"score": 0.0, "raw_score": 0.0, "breakdown": {}, "breakdown_adj": {}, "methods": []}
 
-#     breakdown   = {}
-#     weights     = dict(ENSEMBLE_WEIGHTS)
-#     sbert_ran   = True
+#     breakdown     = {}
+#     breakdown_adj = {}
+#     weights       = dict(ENSEMBLE_WEIGHTS)
+#     sbert_ran     = True
 
 #     # ── A1: TF-IDF ────────────────────────────────────────────────────────
-#     score_tfidf = tfidf_similarity(source, valid_targets)
-#     score_tfidf = min(score_tfidf, MAX_SINGLE_SOURCE_WEIGHT)
-#     breakdown["tfidf"] = round(score_tfidf * 100, 2)
+#     raw_tfidf = tfidf_similarity(source, valid_targets)
+#     raw_tfidf = min(raw_tfidf, MAX_SINGLE_SOURCE_WEIGHT)
+#     adj_tfidf = _apply_noise_floor(raw_tfidf, "tfidf")
+#     breakdown["tfidf"]     = round(raw_tfidf * 100, 2)
+#     breakdown_adj["tfidf"] = round(adj_tfidf * 100, 2)
 
 #     # ── A2: Jaccard N-gram ────────────────────────────────────────────────
-#     score_jaccard = jaccard_similarity_max(source, valid_targets)
-#     score_jaccard = min(score_jaccard, MAX_SINGLE_SOURCE_WEIGHT)
-#     breakdown["jaccard"] = round(score_jaccard * 100, 2)
+#     raw_jaccard = jaccard_similarity_max(source, valid_targets)
+#     raw_jaccard = min(raw_jaccard, MAX_SINGLE_SOURCE_WEIGHT)
+#     adj_jaccard = _apply_noise_floor(raw_jaccard, "jaccard")
+#     breakdown["jaccard"]     = round(raw_jaccard * 100, 2)
+#     breakdown_adj["jaccard"] = round(adj_jaccard * 100, 2)
 
 #     # ── A3: Winnowing Fingerprint ─────────────────────────────────────────
-#     score_winnow = winnowing_similarity_max(source, valid_targets)
-#     score_winnow = min(score_winnow, MAX_SINGLE_SOURCE_WEIGHT)
-#     breakdown["winnowing"] = round(score_winnow * 100, 2)
+#     raw_winnow = winnowing_similarity_max(source, valid_targets)
+#     raw_winnow = min(raw_winnow, MAX_SINGLE_SOURCE_WEIGHT)
+#     adj_winnow = _apply_noise_floor(raw_winnow, "winnowing")
+#     breakdown["winnowing"]     = round(raw_winnow * 100, 2)
+#     breakdown_adj["winnowing"] = round(adj_winnow * 100, 2)
 
 #     # ── A4: Character N-gram ──────────────────────────────────────────────
-#     score_char = char_ngram_similarity_max(source, valid_targets)
-#     score_char = min(score_char, MAX_SINGLE_SOURCE_WEIGHT)
-#     breakdown["char_ngram"] = round(score_char * 100, 2)
+#     raw_char = char_ngram_similarity_max(source, valid_targets)
+#     raw_char = min(raw_char, MAX_SINGLE_SOURCE_WEIGHT)
+#     adj_char = _apply_noise_floor(raw_char, "char_ngram")
+#     breakdown["char_ngram"]     = round(raw_char * 100, 2)
+#     breakdown_adj["char_ngram"] = round(adj_char * 100, 2)
 
 #     # ── B1: Sentence-BERT ─────────────────────────────────────────────────
-#     score_sbert, sbert_available = sbert_similarity_max(source, valid_targets)
+#     raw_sbert, sbert_available = sbert_similarity_max(source, valid_targets)
 #     if sbert_available:
-#         score_sbert = min(score_sbert, MAX_SINGLE_SOURCE_WEIGHT)
-#         breakdown["sbert"] = round(score_sbert * 100, 2)
+#         raw_sbert = min(raw_sbert, MAX_SINGLE_SOURCE_WEIGHT)
+#         adj_sbert = _apply_noise_floor(raw_sbert, "sbert")
+#         breakdown["sbert"]     = round(raw_sbert * 100, 2)
+#         breakdown_adj["sbert"] = round(adj_sbert * 100, 2)
 #     else:
-#         breakdown["sbert"] = None   # Not available
+#         breakdown["sbert"]     = None
+#         breakdown_adj["sbert"] = None
 #         weights = _redistribute_weights(weights, "sbert")
 #         sbert_ran = False
 
-#     # ── Weighted ensemble ─────────────────────────────────────────────────
-#     method_scores = {
-#         "tfidf":      score_tfidf,
-#         "jaccard":    score_jaccard,
-#         "winnowing":  score_winnow,
-#         "char_ngram": score_char,
+#     # ── Weighted ensemble (on noise-floor-adjusted scores) ────────────────
+#     method_scores_adj = {
+#         "tfidf":      adj_tfidf,
+#         "jaccard":    adj_jaccard,
+#         "winnowing":  adj_winnow,
+#         "char_ngram": adj_char,
 #     }
 #     if sbert_ran:
-#         method_scores["sbert"] = score_sbert
+#         method_scores_adj["sbert"] = adj_sbert
 
-#     ensemble = sum(method_scores[k] * weights[k] for k in method_scores)
-#     ensemble = min(100.0, max(0.0, ensemble * 100))
+#     raw_ensemble = sum(method_scores_adj[k] * weights[k] for k in method_scores_adj)
+#     raw_ensemble_pct = min(100.0, max(0.0, raw_ensemble * 100))
 
-#     methods_used = list(method_scores.keys())
+#     # ── Apply calibration curve ───────────────────────────────────────────
+#     calibrated_score = _apply_calibration_curve(raw_ensemble_pct)
+
+#     methods_used = list(method_scores_adj.keys())
+
 #     logger.info(
-#         "Ensemble plagiarism: %.1f%% | tfidf=%.1f%% jaccard=%.1f%% "
-#         "winnow=%.1f%% char=%.1f%% sbert=%s",
-#         ensemble,
-#         breakdown["tfidf"],
-#         breakdown["jaccard"],
-#         breakdown["winnowing"],
-#         breakdown["char_ngram"],
+#         "Plagiarism | raw=%.1f%% calibrated=%.1f%% | "
+#         "tfidf=%.1f%%(adj=%.1f%%) jaccard=%.1f%%(adj=%.1f%%) "
+#         "winnow=%.1f%%(adj=%.1f%%) char=%.1f%%(adj=%.1f%%) sbert=%s",
+#         raw_ensemble_pct, calibrated_score,
+#         breakdown["tfidf"],     breakdown_adj["tfidf"],
+#         breakdown["jaccard"],   breakdown_adj["jaccard"],
+#         breakdown["winnowing"], breakdown_adj["winnowing"],
+#         breakdown["char_ngram"],breakdown_adj["char_ngram"],
 #         f"{breakdown['sbert']}%" if sbert_ran else "N/A",
 #     )
 
 #     return {
-#         "score":     round(ensemble, 2),
-#         "breakdown": breakdown,
-#         "methods":   methods_used,
+#         "score":         round(calibrated_score, 2),
+#         "raw_score":     round(raw_ensemble_pct, 2),
+#         "breakdown":     breakdown,
+#         "breakdown_adj": breakdown_adj,
+#         "methods":       methods_used,
 #     }
 
 
@@ -574,178 +598,44 @@
 # # These are the exact function signatures main.py calls.
 # # Internally they now use the 5-method ensemble.
 
-# def local_plagiarism_score(
-#     text: str,
-#     comparison_texts: List[str],
+# async def local_plagiarism_score(
+#     text: str, 
+#     comparison_texts: Optional[List[str]] = None,
+#     db_service = None
 # ) -> float:
 #     """
-#     PUBLIC API — called by main.py for internal DB and web comparisons.
-
-#     Runs 5-method ensemble and returns final score (0.0 – 100.0).
-#     Backward compatible: same signature as previous version.
-#     """
-#     result = ensemble_plagiarism_score(text, comparison_texts)
-#     return result["score"]
-
-
-# def local_plagiarism_score_with_commoncrawl(text: str) -> float:
-#     """
-#     PUBLIC API — called by main.py for CommonCrawl comparison.
-
-#     Previous version was a stub returning 0.0 always.
-#     This version still returns 0.0 because CommonCrawl requires
-#     a real API endpoint (cdx.commoncrawl.org) which needs a separate
-#     integration. The scoring pipeline in main.py handles this correctly:
+#     Compute plagiarism score against internal database.
     
-#       plagiarism = max(google_score, commoncrawl_score * 0.5)
-    
-#     So 0.0 here simply means CommonCrawl contributes nothing,
-#     and google_score dominates (which is more accurate anyway).
-    
-#     To activate real CommonCrawl: implement cdx_commoncrawl_search()
-#     and replace the return below with that call.
+#     If comparison_texts is None, fetches from DB with pagination.
 #     """
 #     if not text or len(text.split()) < MIN_TOKENS:
 #         return 0.0
-#     return 0.0   # Real CommonCrawl integration: future work
-
-
-# def build_web_source_tokens(urls: List[str]) -> List[str]:
-#     """
-#     PUBLIC API — called by main.py to build matched_sources list.
-#     Converts URL list to DB-safe "web::URL" tokens.
-#     """
-#     seen   = set()
-#     tokens = []
-
-#     for url in urls:
-#         if not url or not isinstance(url, str):
-#             continue
-#         if url in seen:
-#             continue
-#         seen.add(url)
-#         tokens.append(f"web::{url}")
-
-#     return tokens
-
-
-# # ─────────────────────────────────────────────────────────────────────────────
-# # EXTENDED API — NEW METHODS available for future use
-# # ─────────────────────────────────────────────────────────────────────────────
-
-# def local_plagiarism_score_detailed(
-#     text: str,
-#     comparison_texts: List[str],
-# ) -> dict:
-#     """
-#     Extended version of local_plagiarism_score() that returns
-#     per-method breakdown for detailed reporting or debugging.
-
-#     Returns:
-#       {
-#         "score": 73.4,              # final ensemble score
-#         "breakdown": {
-#           "tfidf":     85.2,
-#           "jaccard":   67.1,
-#           "winnowing": 71.3,
-#           "char_ngram": 45.0,
-#           "sbert":     88.4,        # None if SBERT not available
-#         },
-#         "methods": ["tfidf", "jaccard", "winnowing", "char_ngram", "sbert"]
-#       }
-#     """
-#     return ensemble_plagiarism_score(text, comparison_texts)
-
-
-# # ─────────────────────────────────────────────────────────────────────────────
-# # LEGACY HELPERS — kept for backward compatibility, not used by main.py
-# # ─────────────────────────────────────────────────────────────────────────────
-
-# def normalize_scores(ai: float, web: float) -> tuple:
-#     """
-#     ⚠️  DEPRECATED — do NOT call from main.py.
     
-#     This forces AI + Web + Original = 100%, which is WRONG per our
-#     new scoring architecture (Turnitin model: AI and plagiarism are
-#     independent metrics that do NOT sum to 100%).
+#     # If no texts provided, fetch from DB (paginated)
+#     if comparison_texts is None and db_service:
+#         comparison_texts = []
+#         page_size = 100
+#         offset = 0
+        
+#         while True:
+#             batch = await db_service.get_similar_documents_paginated(
+#                 exclude_id=0,  # adjust based on context
+#                 limit=page_size,
+#                 offset=offset
+#             )
+            
+#             if not batch:
+#                 break
+            
+#             comparison_texts.extend([doc["text"] for doc in batch])
+            
+#             if len(batch) < page_size:
+#                 break  # Last page
+            
+#             offset += page_size
     
-#     Kept only for backward compatibility with any external callers.
-#     See main.py compute_scores() for the correct implementation.
-#     """
-#     ai  = max(0.0, min(100.0, ai))
-#     web = max(0.0, min(100.0, web))
-#     total = ai + web
-#     if total > 100.0:
-#         scale = 100.0 / total
-#         ai  *= scale
-#         web *= scale
-#     human = max(0.0, 100.0 - ai - web)
-#     return round(ai, 2), round(web, 2), round(human, 2)
-
-
-# def cosine_similarity(tokens_a: List[str], tokens_b: List[str]) -> float:
-#     """
-#     ⚠️  DEPRECATED — raw bag-of-words cosine, no IDF weighting.
-#     Kept for backward compatibility. Use tfidf_similarity() instead.
-#     """
-#     if not tokens_a or not tokens_b:
-#         return 0.0
-#     vec_a = Counter(tokens_a)
-#     vec_b = Counter(tokens_b)
-#     dot   = sum(vec_a[t] * vec_b.get(t, 0) for t in vec_a)
-#     if dot == 0:
-#         return 0.0
-#     norm_a = math.sqrt(sum(v * v for v in vec_a.values()))
-#     norm_b = math.sqrt(sum(v * v for v in vec_b.values()))
-#     if norm_a == 0 or norm_b == 0:
-#         return 0.0
-#     return dot / (norm_a * norm_b)
-
-
-# def length_weighted_similarity(
-#     source_tokens: List[str],
-#     target_tokens: List[str],
-# ) -> float:
-#     """
-#     ⚠️  DEPRECATED — single-method similarity.
-#     Kept for backward compatibility. Use ensemble_plagiarism_score() instead.
-#     """
-#     if len(source_tokens) < MIN_TOKENS or len(target_tokens) < MIN_TOKENS:
-#         return 0.0
-#     overlap = set(source_tokens) & set(target_tokens)
-#     if len(overlap) < MIN_OVERLAP_TOKENS:
-#         return 0.0
-#     cosine   = cosine_similarity(source_tokens, target_tokens)
-#     coverage = len(overlap) / len(source_tokens)
-#     return min(cosine * coverage, MAX_SINGLE_SOURCE_WEIGHT)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+#     # ... rest of comparison logic ...
+# ```
 
 # backend/app/libs/plagiarism.py
 """
@@ -1197,6 +1087,14 @@ def winnowing_similarity_max(source: str, targets: List[str]) -> float:
 # ─────────────────────────────────────────────────────────────────────────────
 # METHOD A4 — CHARACTER N-GRAM JACCARD SIMILARITY
 # ─────────────────────────────────────────────────────────────────────────────
+# Why useful:
+#   Character n-grams are language-independent and robust to:
+#   • Spelling variations / typos
+#   • OCR errors (common in scanned PDFs)
+#   • Transliteration differences (same word spelled differently)
+#   • Morphological variations (plurals, tense changes)
+#   For Telugu/Hindi text especially — character 5-grams catch shared
+#   script patterns even when normalization strips Unicode.
 
 def char_ngrams(text: str, n: int = CHAR_NGRAM_SIZE) -> set:
     """Extract character n-grams from text."""
@@ -1236,6 +1134,22 @@ def char_ngram_similarity_max(source: str, targets: List[str]) -> float:
 # ─────────────────────────────────────────────────────────────────────────────
 # METHOD B1 — SENTENCE-BERT SEMANTIC SIMILARITY
 # ─────────────────────────────────────────────────────────────────────────────
+# Why useful:
+#   SBERT encodes each document into a dense 384-dimensional vector using
+#   a pretrained transformer (MiniLM fine-tuned on semantic textual similarity).
+#   Two documents that express the SAME IDEAS in different words will have
+#   high cosine similarity in this embedding space.
+# #
+# #   This is the only method that detects paraphrasing — where a plagiarist
+# #   rewrites sentences with synonyms or restructures paragraphs.
+# #   All lexical methods (A1-A4) miss this. SBERT catches it.
+# #
+# #   Model used: all-MiniLM-L6-v2
+# #   Size: ~80MB (downloaded once, cached at ~/.cache/huggingface/)
+# #   Speed: ~50ms per document pair on CPU, ~5ms on GPU
+# #
+# #   Fallback: if not installed or no internet, score = 0.0 and ensemble
+# #   redistributes its 15% weight to other methods.
 
 def _cosine_np(a: np.ndarray, b: np.ndarray) -> float:
     """Fast cosine similarity using numpy."""
@@ -1423,17 +1337,45 @@ def ensemble_plagiarism_score(source: str, targets: List[str]) -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 # PUBLIC API — BACKWARD COMPATIBLE WITH main.py
 # ─────────────────────────────────────────────────────────────────────────────
+# These are the exact function signatures main.py calls.
+# Internally they now use the 5-method ensemble.
 
-def local_plagiarism_score(
-    text: str,
-    comparison_texts: List[str],
+async def local_plagiarism_score(
+    text: str, 
+    comparison_texts: Optional[List[str]] = None,
+    db_service = None
 ) -> float:
     """
-    PUBLIC API — called by main.py for internal DB and web comparisons.
-
-    Runs 5-method ensemble with calibration and returns final score (0.0 – 100.0).
-    Backward compatible: same signature as previous version.
+    Compute plagiarism score against internal database.
+    
+    If comparison_texts is None, fetches from DB with pagination.
     """
+    if not text or len(text.split()) < MIN_TOKENS:
+        return 0.0
+    
+    # If no texts provided, fetch from DB (paginated)
+    if comparison_texts is None and db_service:
+        comparison_texts = []
+        page_size = 100
+        offset = 0
+        
+        while True:
+            batch = await db_service.get_similar_documents_paginated(
+                exclude_id=0,  # adjust based on context
+                limit=page_size,
+                offset=offset
+            )
+            
+            if not batch:
+                break
+            
+            comparison_texts.extend([doc["text"] for doc in batch])
+            
+            if len(batch) < page_size:
+                break  # Last page
+            
+            offset += page_size
+    
     result = ensemble_plagiarism_score(text, comparison_texts)
     return result["score"]
 
