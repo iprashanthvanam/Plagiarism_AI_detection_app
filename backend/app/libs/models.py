@@ -1,16 +1,6 @@
-
-
-
-
-
-
-
-
-
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Optional, List
-from dataclasses import dataclass
+from typing import Optional, List, Dict, Any
 
 @dataclass
 class User:
@@ -44,3 +34,4 @@ class AnalysisResult:
     analysis_date: datetime
     matched_web_sources: Optional[List[str]] = None
     processing_time_seconds: Optional[float] = None
+    sentence_source_map: Optional[Dict[str, int]] = None  # ✅ NEW: Sentence → source index

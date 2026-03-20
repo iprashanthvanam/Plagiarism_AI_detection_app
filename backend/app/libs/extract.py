@@ -86,6 +86,7 @@ except Exception as e:
 # CONSTANTS
 # ============================================================
 MIN_LOCAL_TEXT = 10
+MIN_SELECTABLE_CHARS = 100  # ✅ ADD THIS — minimum chars to consider PDF digital
 
 # Pages below this alpha-char ratio are skipped (garbage OCR)
 OCR_QUALITY_THRESHOLD = 0.40
@@ -132,49 +133,98 @@ _DOC_NOISE = {
 }
 
 # ============================================================
-# MAX CHARS CONSTANTS
-# ============================================================
-MAX_CHARS = 500000  # Max characters to extract from any file
-MIN_SELECTABLE_CHARS = 50  # Minimum text chars to consider a PDF "digital"
-
-# ============================================================
 # HELPER FUNCTIONS — EXTRACTION
 # ============================================================
 
 def _extract_docx(file_path: str) -> str:
-    """Extract text from .docx (Word 2007+) or .doc (legacy binary)."""
+    """
+    Extract COMPLETE text from .docx PRESERVING structure.
+    ✅ NO TRUNCATION — returns full document text
+    """
     try:
         doc = Document(file_path)
-        text = "\n".join(para.text for para in doc.paragraphs if para.text.strip())
+        sections = []
+        
+        for para in doc.paragraphs:
+            if not para.text.strip():
+                continue
+            
+            style_name = para.style.name if para.style else ""
+            is_heading = "Heading" in style_name
+            
+            if is_heading:
+                level = "".join(c for c in style_name if c.isdigit()) or "1"
+                sections.append(f"\n{'#' * int(level)} {para.text.strip()}\n")
+            else:
+                sections.append(para.text.strip())
+        
+        for table in doc.tables:
+            sections.append("\n[TABLE]\n")
+            for row in table.rows:
+                row_text = " | ".join(cell.text.strip() for cell in row.cells)
+                sections.append(row_text)
+            sections.append("[/TABLE]\n")
+        
+        text = "\n\n".join(sections)
         if text:
-            logger.info(".docx extracted: %s (%d chars)", 
-                       os.path.basename(file_path), len(text))
-            return text[:MAX_CHARS]
-        logger.warning(".docx has no paragraphs — trying binary extraction")
+            logger.info(
+                "✅ DOCX extracted (COMPLETE): %s (%d chars)",
+                os.path.basename(file_path), len(text)
+            )
+            return text  # ✅ NO TRUNCATION
+        
+        logger.warning("DOCX has no content — trying binary extraction")
         return _extract_doc_binary(file_path)
+    
     except Exception as e:
         logger.warning("DOCX extraction failed for %s: %s", file_path, e)
-        # Fall back to binary .doc extraction
         return _extract_doc_binary(file_path)
 
 
 def _extract_pptx(file_path: str) -> str:
-    """Extract text from PowerPoint (.pptx)."""
+    """Extract COMPLETE text from PowerPoint. ✅ NO TRUNCATION"""
     try:
         prs = Presentation(file_path)
-        texts = []
+        slides = []
+        
         for slide_num, slide in enumerate(prs.slides, 1):
+            slide_content = []
+            
             for shape in slide.shapes:
-                if hasattr(shape, "text") and shape.text.strip():
-                    texts.append(shape.text.strip())
+                if not hasattr(shape, "text"):
+                    continue
+                
+                text = shape.text.strip()
+                if not text:
+                    continue
+                
+                if hasattr(shape, "is_placeholder") and shape.is_placeholder:
+                    phf = shape.placeholder_format
+                    if phf.type == 1:
+                        slide_content.insert(0, f"\n## Slide {slide_num}: {text}\n")
+                        continue
+                
+                if hasattr(shape, "text_frame"):
+                    for para in shape.text_frame.paragraphs:
+                        level = para.level
+                        indent = "  " * level
+                        bullet = "• " if para.level == 0 else "◦ "
+                        slide_content.append(f"{indent}{bullet}{para.text.strip()}")
+                else:
+                    slide_content.append(text)
+            
+            if slide_content:
+                slides.append("\n".join(slide_content))
         
-        result = "\n".join(texts)
-        if result:
-            logger.info("PPTX extracted: %s (%d chars)", 
-                       os.path.basename(file_path), len(result))
-            return result[:MAX_CHARS]
+        text = "\n\n".join(slides)
+        if text:
+            logger.info(
+                "✅ PPTX extracted (COMPLETE): %s (%d chars)",
+                os.path.basename(file_path), len(text)
+            )
+            return text  # ✅ NO TRUNCATION
         
-        logger.warning("PPTX has no text — trying Gemini for embedded images")
+        logger.warning("PPTX has no text")
         return ""
     
     except Exception as e:
@@ -213,19 +263,32 @@ def _is_scanned_pdf(file_path: str) -> bool:
 
 
 def _extract_pdfplumber(file_path: str) -> str:
-    """Extract text from digital PDFs using pdfplumber."""
+    """Extract COMPLETE text from digital PDFs. ✅ NO TRUNCATION"""
     try:
         with pdfplumber.open(file_path) as pdf:
-            texts = []
-            for page in pdf.pages:
-                text = page.extract_text()
-                if text and text.strip():
-                    texts.append(text.strip())
+            pages = []
             
-            result = "\n".join(texts)
-            logger.info("pdfplumber: %s (%d chars)",
-                       os.path.basename(file_path), len(result))
-            return result[:MAX_CHARS]
+            for page_num, page in enumerate(pdf.pages, 1):
+                # Try to extract text with layout preserved
+                text = page.extract_text(layout=True)
+                
+                if not text:
+                    # Fallback to simple extraction
+                    text = page.extract_text()
+                
+                if text and text.strip():
+                    # Preserve page breaks for long documents
+                    if len(pdf.pages) > 1:
+                        pages.append(f"\n--- Page {page_num} ---\n{text.strip()}")
+                    else:
+                        pages.append(text.strip())
+            
+            result = "\n\n".join(pages)
+            logger.info(
+                "✅ pdfplumber (COMPLETE): %s (%d chars)",
+                os.path.basename(file_path), len(result)
+            )
+            return result  # ✅ NO TRUNCATION
     
     except Exception as e:
         logger.warning("pdfplumber failed for %s: %s", file_path, e)
@@ -233,89 +296,15 @@ def _extract_pdfplumber(file_path: str) -> str:
 
 
 async def _extract_scanned_pdf(file_path: str) -> str:
-    """
-    Main scanned PDF extraction router:
-    1. Try Gemini first (multilingual, handles handwriting)
-    2. Fall back to Tesseract + language detection if Gemini fails or quota hit
-    """
-    # Try Gemini first (PRIMARY)
-    text, quota_exceeded = await _extract_scanned_pdf_gemini(file_path)
+    """Extract COMPLETE text from scanned PDFs. ✅ NO TRUNCATION"""
+    text, _ = await _extract_scanned_pdf_gemini(file_path)
     if text:
-        return text[:MAX_CHARS]
-    
-    # Fall back to local Tesseract if Gemini unavailable or quota-exceeded
-    if quota_exceeded:
-        logger.info("Gemini quota exceeded — using Tesseract fallback")
+        logger.info("✅ Scanned PDF via Gemini (COMPLETE): %d chars", len(text))
+        return text  # ✅ NO TRUNCATION
     
     text = _extract_scanned_pdf_local(file_path)
-    return text[:MAX_CHARS]
-
-
-async def _extract_with_gemini(file_path: str) -> str:
-    """Fallback Gemini extraction for unknown/image formats."""
-    if not _gemini_available or not extract_text_with_gemini:
-        logger.warning("Gemini not available")
-        return ""
-    
-    try:
-        result = await extract_text_with_gemini(file_path, is_pdf=False)
-        if result:
-            logger.info("Gemini extraction: %s (%d chars)",
-                       os.path.basename(file_path), len(result))
-            return result[:MAX_CHARS]
-    except Exception as e:
-        logger.warning("Gemini extraction failed for %s: %s", file_path, e)
-    
-    return ""
-
-
-def _extract_with_paddleocr(img) -> str:
-    """
-    Optional: PaddleOCR for images (faster, multilingual).
-    Falls back to Tesseract if not available.
-    """
-    try:
-        from paddleocr import PaddleOCR
-        ocr = PaddleOCR(use_angle_cls=True, lang='en')
-        result = ocr.ocr(img, cls=True)
-        texts = [line[1][0] for line in result if line]
-        return "\n".join(texts) if texts else ""
-    except Exception:
-        return ""
-
-
-def _extract_with_tesseract(img) -> str:
-    """Tesseract OCR for standalone images."""
-    if not _tesseract_available:
-        return ""
-    
-    try:
-        processed = _preprocess_for_tesseract(img)
-        # Quick language detection
-        p1_text = pytesseract.image_to_string(
-            processed,
-            config=f"{TESSERACT_BASE_CONFIG} -l eng",
-            timeout=20
-        )
-        detected = _detect_indic_scripts(p1_text)
-        lang = _build_tesseract_lang_string(detected)
-        
-        if lang != "eng":
-            text = pytesseract.image_to_string(
-                processed,
-                config=f"{TESSERACT_BASE_CONFIG} -l {lang}",
-                timeout=30
-            )
-        else:
-            text = p1_text
-        
-        logger.info("Tesseract image OCR: %d chars (lang=%s)",
-                   len(text), lang)
-        return text.strip()
-    
-    except Exception as e:
-        logger.warning("Tesseract failed for image: %s", e)
-        return ""
+    logger.info("✅ Scanned PDF via Tesseract (COMPLETE): %d chars", len(text))
+    return text  # ✅ NO TRUNCATION
 
 
 # ============================================================
@@ -697,157 +686,90 @@ def _extract_image_local(file_path: str) -> str:
 
 
 def _extract_spreadsheet(file_path: str, ext: str) -> str:
-    """XLS/XLSX extraction — NaN-free cell iteration."""
+    """Extract COMPLETE text from XLS/XLSX. ✅ NO TRUNCATION"""
     try:
         engine = "xlrd" if ext == ".xls" else "openpyxl"
         dfs = pd.read_excel(file_path, sheet_name=None, engine=engine)
-        lines: list = []
+        
+        sheets = []
         for sheet_name, df in dfs.items():
+            sheet_lines = []
+            
             if len(dfs) > 1:
-                lines.append(f"[Sheet: {sheet_name}]")
+                sheet_lines.append(f"\n## Sheet: {sheet_name}\n")
+            
+            headers = [str(col).strip() for col in df.columns]
+            sheet_lines.append(" | ".join(headers))
+            sheet_lines.append("-" * len(" | ".join(headers)))
+            
             for _, row in df.iterrows():
-                cell_values: list = []
+                cell_values = []
                 for val in row:
                     if pd.isna(val):
-                        continue
-                    sval = str(val).strip()
-                    if not sval or sval.lower() == "nan":
-                        continue
-                    cell_values.append(sval)
-                if cell_values:
-                    lines.append("  ".join(cell_values))
-
-        result = "\n".join(lines)
-        logger.info(
-            "Spreadsheet (%s) extracted cleanly (NaN-free): %s (%d chars)",
-            ext, os.path.basename(file_path), len(result)
-        )
-        return result
-
+                        cell_values.append("")
+                    else:
+                        sval = str(val).strip()
+                        if sval.lower() == "nan":
+                            cell_values.append("")
+                        else:
+                            cell_values.append(sval)
+                
+                if any(cell_values):
+                    sheet_lines.append(" | ".join(cell_values))
+            
+            sheets.append("\n".join(sheet_lines))
+        
+        text = "\n\n".join(sheets)
+        if text:
+            logger.info(
+                "✅ Spreadsheet (%s) extracted (COMPLETE): %s (%d chars)",
+                ext, os.path.basename(file_path), len(text)
+            )
+            return text  # ✅ NO TRUNCATION
+        
+        return ""
+    
     except Exception as e:
         logger.warning("Spreadsheet extraction failed for %s: %s", file_path, e)
         return ""
 
 
 async def extract_text(file_path: str, content_type: str = "") -> str:
-    """Extract text from any supported file format."""
+    """
+    Extract COMPLETE text from any supported file format.
+    ✅ NO TRUNCATION — returns full document text
+    ✅ Validation added in tasks.py before DB storage
+    """
     if not os.path.exists(file_path):
         logger.error("File not found: %s", file_path)
         return ""
 
     ext = os.path.splitext(file_path)[1].lower()
 
-    # Plain text
     if ext == ".txt" or "text/plain" in content_type:
         try:
             with open(file_path, "r", encoding="utf-8", errors="replace") as f:
-                return f.read()[:MAX_CHARS]
+                result = f.read()  # ✅ NO TRUNCATION
+                logger.info("✅ TXT extracted (COMPLETE): %d chars", len(result))
+                return result
         except Exception:
             return ""
 
-    # Word document
     if ext in (".docx", ".doc") or "wordprocessingml" in content_type:
-        text = _extract_docx(file_path)
-        if text:
-            return text
-        logger.info("DOCX has no text - trying Gemini for embedded images")
-        return await _extract_with_gemini(file_path)
+        return _extract_docx(file_path)
 
-    # ✅ SPREADSHEETS — XLS/XLSX (NEW)
     if ext in (".xls", ".xlsx") or "spreadsheet" in content_type.lower():
-        text = _extract_spreadsheet(file_path, ext)
-        if text and len(text.strip()) >= 10:  # Very low bar for spreadsheets
-            logger.info("Spreadsheet extracted: %s (%d chars)", 
-                       os.path.basename(file_path), len(text))
-            return text
-        logger.warning("Spreadsheet empty or unreadable: %s", 
-                      os.path.basename(file_path))
-        return ""  # Don't fall back to Gemini for spreadsheets
+        return _extract_spreadsheet(file_path, ext)
 
-    # PowerPoint
     if ext == ".pptx" or "presentation" in content_type.lower():
-        try:
-            from pptx import Presentation
-            prs = Presentation(file_path)
-            text = "\n".join(
-                shape.text
-                for slide in prs.slides
-                for shape in slide.shapes
-                if hasattr(shape, "text") and shape.text.strip()
-            )
-            if text:
-                return text[:MAX_CHARS]
-        except Exception as e:
-            logger.warning("PPTX extraction failed: %s", e)
-        return ""
+        return _extract_pptx(file_path)
 
-    # Image files
-    if ext in (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tiff") \
-            or (content_type and content_type.startswith("image/")):
-        try:
-            image = Image.open(file_path)
-            text = _extract_with_paddleocr(image)
-            if text and len(text.strip()) >= 20:
-                return text
-            text = _extract_with_tesseract(image)
-            if text and len(text.strip()) >= 20:
-                return text
-            return await _extract_with_gemini(file_path)
-        except Exception as e:
-            logger.debug("Image open failed: %s", e)
-            return await _extract_with_gemini(file_path)
-
-    # PDF
     if ext == ".pdf" or "pdf" in content_type:
         if not _is_scanned_pdf(file_path):
-            text = _extract_with_pdfplumber(file_path)
-            if text and len(text.strip()) >= MIN_SELECTABLE_CHARS:
-                logger.info("Text PDF: %d chars via pdfplumber", len(text))
+            text = _extract_pdfplumber(file_path)
+            if text and len(text.strip()) >= 50:
                 return text
-            logger.info("PDF has partial text - running full OCR pipeline")
-        return await _extract_scanned_pdf(file_path)
+        return await _extract_scanned_pdf(file_path)  # ✅ NOW WITH await
 
-    # Unknown
-    logger.warning("Unknown type ext=%s - trying Gemini", ext)
-    return await _extract_with_gemini(file_path)
-
-
-def _extract_spreadsheet(file_path: str, ext: str) -> str:
-    """
-    Extract readable text from XLS/XLSX — NaN-free cell iteration.
-    
-    CRITICAL: Do NOT use df.astype(str).to_string() — it converts
-    every empty cell to the literal string "NaN" which contaminates
-    the extracted text and plagiarism scoring.
-    """
-    try:
-        engine = "xlrd" if ext == ".xls" else "openpyxl"
-        dfs = pd.read_excel(file_path, sheet_name=None, engine=engine)
-        
-        lines: list = []
-        for sheet_name, df in dfs.items():
-            if len(dfs) > 1:
-                lines.append(f"[Sheet: {sheet_name}]")
-            
-            for _, row in df.iterrows():
-                cell_values: list = []
-                for val in row:
-                    if pd.isna(val):
-                        continue
-                    sval = str(val).strip()
-                    if not sval or sval.lower() == "nan":
-                        continue
-                    cell_values.append(sval)
-                if cell_values:
-                    lines.append("  ".join(cell_values))
-        
-        result = "\n".join(lines)
-        logger.info(
-            "Spreadsheet (%s) extracted cleanly (NaN-free): %s (%d chars)",
-            ext, os.path.basename(file_path), len(result)
-        )
-        return result
-    
-    except Exception as e:
-        logger.warning("Spreadsheet extraction failed for %s: %s", file_path, e)
-        return ""
+    logger.warning("Unknown type ext=%s", ext)
+    return ""

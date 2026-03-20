@@ -126,6 +126,7 @@ from slowapi.errors import RateLimitExceeded
 from app.core.limitter import limiter
 from app.core.celery_client import celery_app
 from app.tasks import run_analysis
+from app.api.student import router as student_router
 
 load_dotenv()
 
@@ -205,14 +206,18 @@ async def startup():
 # AUTH HELPERS
 # ═══════════════════════════════════════════════════════════════════════
 
-def create_access_token(data: dict, expires_delta: timedelta):
+def create_access_token(data: dict, expires_delta: timedelta = None):
+    """Create JWT access token."""
     to_encode = data.copy()
+    if expires_delta is None:
+        expires_delta = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     expire = datetime.now(timezone.utc) + expires_delta
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
 
 async def get_current_user(request: Request):
+    """Extract and validate JWT token from cookies."""
     token = request.cookies.get("access_token")
     if not token:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated")
@@ -229,11 +234,53 @@ async def get_current_user(request: Request):
 
 
 def require_role(required_role: str):
+    """Dependency to enforce role-based access."""
     def checker(user: Dict[str, Any] = Depends(get_current_user)):
         if user["role"] != required_role:
             raise HTTPException(status_code=403, detail="Forbidden")
         return user
     return checker
+
+
+# ✅ NEW: Validate login credentials
+async def validate_login(form_data: OAuth2PasswordRequestForm = Depends()) -> Dict[str, Any]:
+    """
+    Authenticate user by username and password.
+    
+    Args:
+        form_data: OAuth2 form with username and password
+    
+    Returns:
+        User dict with id, username, role
+        
+    Raises:
+        HTTPException 401 if credentials invalid
+    """
+    # Get user from database
+    user = await db_service.get_user_by_username(form_data.username)
+    
+    if not user:
+        logger.warning("Login failed: user '%s' not found", form_data.username)
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid username or password"
+        )
+    
+    # Verify password
+    if not pwd_context.verify(form_data.password, user["password_hash"]):
+        logger.warning("Login failed: invalid password for user '%s'", form_data.username)
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid username or password"
+        )
+    
+    logger.info("Login successful for user '%s' (role: %s)", user["username"], user["role"])
+    
+    return {
+        "id": user["user_id"],
+        "username": user["username"],
+        "role": user["role"],
+    }
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -249,7 +296,17 @@ def require_role(required_role: str):
 # This avoids any schema changes while carrying per-URL match data.
 
 def encode_web_source(url: str, match_pct: Optional[float] = None) -> str:
-    """Encode a web source URL (with optional match%) as a DB-safe string."""
+    """
+    Encode a web source URL (with optional match%).
+    ✅ NEW: Only encode if match_pct >= 0.1%
+    
+    Returns DB-safe string format: "web::URL::match_pct"
+    """
+    # ✅ Filter: Don't encode 0% matches
+    if match_pct is not None and match_pct < 0.1:
+        logger.debug("Skipping 0%% match URL: %s", url[:60])
+        return None  # Return None to signal skip in caller
+    
     if match_pct is not None:
         return f"web::{url}::{round(match_pct, 2)}"
     return f"web::{url}"
@@ -457,21 +514,50 @@ async def health_check():
 
 @app.post("/auth/login")
 @limiter.limit(RATE_LIMIT_LOGIN)
-async def login(request: Request, response: Response, form: OAuth2PasswordRequestForm = Depends()):
-    """Login — 10 requests per minute per IP"""
-    user = await db_service.get_user(form.username)
-    if not user or not pwd_context.verify(form.password, user["password_hash"]):
-        raise HTTPException(status_code=400, detail="Incorrect username or password")
-    role = user.get("role", "student")
-    token = create_access_token(
-        {"sub": user["user_id"], "username": user["username"], "role": role},
-        timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES),
+async def login(request: Request, user=Depends(validate_login)):
+    """
+    ✅ FIXED: Set JWT token as HttpOnly cookie (not JSON).
+    
+    Browser automatically sends cookie on all subsequent requests.
+    get_current_user() reads it from request.cookies.
+    """
+    
+    # Create JWT payload
+    payload = {
+        "sub": user["id"],
+        "username": user["username"],
+        "role": user["role"],
+    }
+    
+    access_token = create_access_token(payload)
+    
+    # ✅ CRITICAL: Create response object to set cookie
+    response = JSONResponse(
+        status_code=200,
+        content={
+            "success": True,
+            "user_id": user["id"],
+            "username": user["username"],
+            "role": user["role"],
+        }
     )
+    
+    # ✅ SET COOKIE (HttpOnly = not accessible via JavaScript)
     response.set_cookie(
-        key="access_token", value=token, httponly=True, secure=True,
-        samesite="lax", max_age=ACCESS_TOKEN_EXPIRE_MINUTES * 60, path="/"
+        key="access_token",
+        value=access_token,
+        max_age=ACCESS_TOKEN_EXPIRE_MINUTES * 60,  # 30 minutes
+        httponly=True,  # Prevents JavaScript theft (XSS protection)
+        secure=False,   # Set to True in production (HTTPS only)
+        samesite="lax",  # CSRF protection
     )
-    return {"success": True, "user_id": user["user_id"], "username": user["username"], "role": role}
+    
+    logger.info(
+        "Login successful | user=%s role=%s | token set in cookie",
+        user["username"], user["role"]
+    )
+    
+    return response
 
 
 @app.post("/auth/logout")
@@ -609,58 +695,34 @@ async def analyze(request: Request, document_id: int, user=Depends(get_current_u
 @app.get("/task-status/{task_id}")
 @limiter.limit(RATE_LIMIT_STATUS)
 async def task_status(request: Request, task_id: str, user=Depends(get_current_user)):
-    """
-    Poll Celery task status by task_id.
-    
-    Returns:
-      {
-        "status": "PENDING" | "PROGRESS" | "SUCCESS" | "FAILURE",
-        "progress": 0-100,
-        "stage": "string describing current step",
-        "result": { full AnalysisResult if SUCCESS },
-        "error": "error message if FAILURE",
-      }
-    
-    Frontend polls every 2-3 seconds until status == "SUCCESS" or "FAILURE"
-    """
+    """Poll Celery task status and return result when complete."""
     task = celery_app.AsyncResult(task_id)
     
     if task.state == "PENDING":
-        return {
-            "status": "pending",
-            "progress": 0,
-            "stage": "Task not yet started (queue may be busy)",
-            "task_id": task_id,
-        }
+        return {"success": False, "status": "pending", "progress": 0}
     
-    elif task.state == "PROGRESS":
-        meta = task.info or {}
-        return {
-            "status": "analyzing",
-            "progress": meta.get("progress", 0),
-            "stage": meta.get("stage", "Processing"),
-            "task_id": task_id,
-        }
+    if task.state == "PROGRESS":
+        return {"success": False, "status": "analyzing", "progress": task.info.get("progress", 0)}
     
-    elif task.state == "SUCCESS":
-        result_data = task.result or {}
-        document_id = result_data.get("document_id")
+    if task.state == "FAILURE":
+        return {"success": False, "status": "failed", "error": str(task.info)}
+    
+    if task.state == "SUCCESS":
+        result_dict = task.result
+        document_id = result_dict.get("document_id")
         
-        # ── Fetch full analysis result from DB ────────────────────────
-        # (needed to decode sources and construct complete response)
-        db_result = await db_service.get_analysis_result_for_document(document_id)
-        if not db_result:
-            return {
-                "status": "error",
-                "error": "Analysis completed but result not found in database",
-            }
-        
-        # ── Verify authorization (user can only see their own results) ──
+        # Fetch full result from DB
         doc = await db_service.get_document(document_id)
+        if not doc:
+            raise HTTPException(404, "Document not found")
         if doc["user_id"] != user["id"] and user["role"] != "admin":
             raise HTTPException(403, "Unauthorized")
         
-        # ── Decode matched sources ───────────────────────────────────────
+        db_result = await db_service.get_analysis_result_for_document(document_id)
+        if not db_result:
+            raise HTTPException(404, "Analysis result not found")
+        
+        # ── Decode matched sources ───────────────────────────────────
         raw_sources = db_result.get("matched_web_sources", []) or []
         decoded_sources = []
         for s in raw_sources:
@@ -668,7 +730,17 @@ async def task_status(request: Request, task_id: str, user=Depends(get_current_u
             if decoded:
                 decoded_sources.append(decoded)
         
-        # ── Pull scores ──────────────────────────────────────────────────
+        # ── Parse sentence source map from JSONB ────────────────────
+        sentence_source_map = {}
+        raw_map = db_result.get("sentence_source_map")
+        if raw_map:
+            if isinstance(raw_map, str):
+                import json
+                sentence_source_map = json.loads(raw_map)
+            elif isinstance(raw_map, dict):
+                sentence_source_map = raw_map
+        
+        # ── Pull scores ──────────────────────────────────────────────
         extracted_text = doc.get("extracted_text", "") or ""
         ai_pct = float(db_result["ai_detected_percentage"])
         plag_pct = float(db_result["web_source_percentage"])
@@ -678,7 +750,6 @@ async def task_status(request: Request, task_id: str, user=Depends(get_current_u
         return {
             "success": True,
             "status": "completed",
-            "task_id": task_id,
             "progress": 100,
             "result": {
                 "document_id": document_id,
@@ -698,38 +769,19 @@ async def task_status(request: Request, task_id: str, user=Depends(get_current_u
                 "matched_sources": decoded_sources,
                 "processing_time_seconds": db_result.get("processing_time_seconds", 0),
                 "extracted_text": extracted_text,
+                "sentence_source_map": sentence_source_map,  # ✅ NEW
             },
         }
     
-    elif task.state == "FAILURE":
-        logger.error(f"Task {task_id} failed: {task.info}")
-        return {
-            "status": "failed",
-            "error": str(task.info),
-            "task_id": task_id,
-        }
-    
-    else:
-        return {
-            "status": "unknown",
-            "state": task.state,
-            "task_id": task_id,
-        }
+    return {"success": False, "status": "unknown"}
 
-
-# ─────────────────────────────────────────────────────────────────────
-# KEEP OLD /analysis-status/{document_id} for backward compatibility
-# (but it now checks if analysis result exists in DB, no longer runs it)
-# ─────────────────────────────────────────────────────────────────────
 
 @app.get("/analysis-status/{document_id}")
 @limiter.limit(RATE_LIMIT_STATUS)
 async def analysis_status(request: Request, document_id: int, user=Depends(get_current_user)):
     """
     DEPRECATED: Use /task-status/{task_id} instead.
-    
-    This endpoint kept for backward compatibility — just returns
-    the stored result if it exists, doesn't run analysis.
+    Kept for backward compatibility.
     """
     doc = await db_service.get_document(document_id)
     if not doc:
@@ -748,6 +800,16 @@ async def analysis_status(request: Request, document_id: int, user=Depends(get_c
         decoded = decode_source(s)
         if decoded:
             decoded_sources.append(decoded)
+    
+    # ── Parse sentence source map from JSONB ────────────────────────────
+    sentence_source_map = {}
+    raw_map = result.get("sentence_source_map")
+    if raw_map:
+        if isinstance(raw_map, str):
+            import json
+            sentence_source_map = json.loads(raw_map)
+        elif isinstance(raw_map, dict):
+            sentence_source_map = raw_map
 
     # ── Pull scores ──────────────────────────────────────────────────────
     extracted_text = doc.get("extracted_text", "") or ""
@@ -777,6 +839,7 @@ async def analysis_status(request: Request, document_id: int, user=Depends(get_c
             "matched_sources": decoded_sources,
             "processing_time_seconds": result.get("processing_time_seconds", 0),
             "extracted_text": extracted_text,
+            "sentence_source_map": sentence_source_map,  # ✅ NEW
         },
     }
 
@@ -818,3 +881,6 @@ async def serve_react_app(full_path: str):
     if os.path.exists(index_path):
         return FileResponse(index_path)
     return {"error": "Frontend build not found."}
+
+# Register routes
+app.include_router(student_router)

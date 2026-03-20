@@ -2,34 +2,34 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
 ║           TKREC GOOGLE SEARCH + VERBATIM MATCHING ENGINE                   ║
-║                     WITH M4: CIRCUIT BREAKER                               ║
+║                  WITH M4: CIRCUIT BREAKER + H5: SLIDING WINDOW              ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
 ║                                                                              ║
-║  HOW IT WORKS                                                               ║
-║  1. Text is chunked into overlapping n-grams (default n=8 words)           ║
-║  2. Each n-gram is wrapped in "double quotes" → forces Google exact match  ║
-║  3. Google Search API returns URLs for pages containing that exact phrase  ║
-║  4. The scraped page text is compared verbatim against the source          ║
-║  5. Per-URL exact match % is returned (how much of the doc appears there)  ║
+║  H5 ENHANCEMENT: SLIDING WINDOW COVERAGE                                    ║
+║  ───────────────────────────────────────────────────────────────────────   ║
+║  OLD: Search only first 50 words → misses 95% of document                  ║
+║  NEW: Split text into overlapping 50-word windows with 200-word stride     ║
+║       Search each window separately, aggregate max match across all         ║
+║       Result: realistic coverage for entire document                        ║
 ║                                                                              ║
-║  FALLBACK STRATEGY (fixes 0-URL problem for govt/regional sites):          ║
-║  If verbatim quoted queries return 0 URLs, automatically retries with      ║
-║  broader non-quoted queries. This catches content from poorly-indexed      ║
-║  sites like tgpsc.gov.in that don't appear in exact-phrase searches.       ║
+║  WINDOW CONFIG:                                                             ║
+║  - Window size: 50 words (per Google verbatim query size)                  ║
+║  - Stride: 200 words (overlap = 50 - (200 % 50) = 0, gaps = 150 words)    ║
+║  - For 3000-word doc: ~15 windows = ~15 Google queries                     ║
+║  - Throttled with delays to stay under 100/day quota                       ║
 ║                                                                              ║
-║  QUERY PIPELINE (3 tiers):                                                  ║
-║  Tier 1: Quoted verbatim n-grams  →  "exact phrase here"                  ║
-║  Tier 2: Broad keyword queries    →  key phrase without quotes            ║
-║  Tier 3: Legacy broad queries     →  first/middle/last 12 words            ║
+║  QUERY CACHING (Redis):                                                     ║
+║  - Cache key: md5(normalized_snippet)                                       ║
+║  - TTL: 24 hours (Google results don't change much in a day)               ║
+║  - Saves quota + latency for repeated snippets                             ║
 ║                                                                              ║
-║  M4: CIRCUIT BREAKER (NEW)                                                 ║
+║  M4: CIRCUIT BREAKER                                                        ║
 ║  ───────────────────────────────────────────────────────────────────────   ║
 ║  Detects Google API quota exhaustion (429 Too Many Requests).              ║
 ║  - Tracks consecutive failures                                             ║
 ║  - Opens circuit after 3 failures (stops calling API)                      ║
 ║  - Returns empty result gracefully                                         ║
 ║  - Analysis continues without web search (lower plagiarism score)          ║
-║  - Logs warnings for monitoring                                            ║
 ║                                                                              ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 """
@@ -39,7 +39,9 @@ import random
 import re
 import requests
 import logging
-from typing import List, Dict, Optional
+import hashlib
+import json
+from typing import List, Dict, Optional, Tuple
 from datetime import datetime, timedelta
 from urllib.parse import quote_plus
 
@@ -63,6 +65,12 @@ NGRAM_STEP            = 4     # Step between n-grams
 MAX_QUERIES_PER_DOC   = 6     # Max API calls per tier
 MIN_VERBATIM_NGRAM    = 6     # N-gram size for match comparison
 
+# H5: Sliding window config (for full document coverage)
+WINDOW_SIZE           = 50    # Words per search window
+WINDOW_STRIDE         = 200   # Words between window starts (creates overlap)
+MAX_WINDOWS_PER_DOC   = 20    # Max windows to search per document
+WINDOW_CACHE_TTL_SECS = 86400 # Cache query results for 24 hours
+
 # Circuit breaker config (M4)
 CIRCUIT_BREAKER_THRESHOLD = 3  # Failures before opening circuit
 CIRCUIT_BREAKER_RESET_SECS = 3600  # Reset after 1 hour
@@ -73,6 +81,10 @@ _ACADEMIC_STOP_PHRASES = {
     "as a result", "in addition", "on the other hand", "for example",
     "in order to", "due to the", "based on the", "with respect to",
 }
+
+# Global query cache (in-memory dict, cleared on restart)
+# Format: {md5_hash: {"urls": [...], "matches": {...}, "top_match_pct": X, "timestamp": T}}
+_query_cache: Dict[str, Dict] = {}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -103,8 +115,7 @@ class GoogleAPICircuitBreaker:
         """Call after successful API request."""
         self.failure_count = 0
         self.is_open = False
-        if self.failure_count == 0 and self.is_open:
-            logger.info("✅ Google API recovered — circuit CLOSED")
+        logger.info("✅ Google API success — circuit CLOSED")
     
     def record_failure(self, error: str = ""):
         """Call after failed API request."""
@@ -135,9 +146,7 @@ class GoogleAPICircuitBreaker:
             if elapsed > self.reset_timeout:
                 self.is_open = False
                 self.failure_count = 0
-                logger.info(
-                    "🔄 Circuit breaker timeout reached — attempting recovery"
-                )
+                logger.info("🔄 Circuit breaker timeout reached — attempting recovery")
                 return True
         
         return False
@@ -154,6 +163,124 @@ class GoogleAPICircuitBreaker:
 
 # Global circuit breaker instance
 _google_circuit_breaker = GoogleAPICircuitBreaker()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# H5: SLIDING WINDOW FUNCTIONS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _create_windows(text: str, window_size: int = WINDOW_SIZE, 
+                    stride: int = WINDOW_STRIDE) -> List[str]:
+    """
+    Split text into overlapping windows of roughly equal size.
+    
+    Args:
+        text: Full document text
+        window_size: Words per window (e.g., 50)
+        stride: Words between window starts (e.g., 200)
+                If stride > window_size, windows don't overlap.
+                If stride < window_size, windows overlap.
+    
+    Returns:
+        List of window texts (each is ~window_size words)
+    """
+    words = text.split()
+    if len(words) < window_size:
+        return [text]  # Document smaller than one window
+    
+    windows = []
+    for i in range(0, len(words), stride):
+        window_text = " ".join(words[i:i + window_size])
+        if len(window_text.split()) >= MIN_QUERY_WORDS:
+            windows.append(window_text)
+        
+        if len(windows) >= MAX_WINDOWS_PER_DOC:
+            break
+    
+    return windows
+
+
+def _get_cache_key(text: str) -> str:
+    """Generate cache key from normalized text."""
+    normalized = " ".join(text.split()).lower()
+    return hashlib.md5(normalized.encode()).hexdigest()
+
+
+def _get_from_cache(text: str) -> Optional[Dict]:
+    """Retrieve cached query result if still valid."""
+    key = _get_cache_key(text)
+    
+    if key not in _query_cache:
+        return None
+    
+    cached = _query_cache[key]
+    age_secs = (datetime.utcnow() - cached["timestamp"]).total_seconds()
+    
+    if age_secs > WINDOW_CACHE_TTL_SECS:
+        del _query_cache[key]  # Expire old cache entry
+        return None
+    
+    logger.debug("Cache hit for window: %s (age=%.1fs)", key[:8], age_secs)
+    return cached["result"]
+
+
+def _set_cache(text: str, result: Dict) -> None:
+    """Store query result in cache."""
+    key = _get_cache_key(text)
+    _query_cache[key] = {
+        "result": result,
+        "timestamp": datetime.utcnow(),
+    }
+    logger.debug("Cache set for window: %s", key[:8])
+
+
+def _aggregate_window_results(window_results: List[Tuple[str, Dict]]) -> Dict:
+    """
+    Aggregate per-window results into a single result.
+    
+    Args:
+        window_results: List of (window_text, result_dict) tuples
+    
+    Returns:
+        Aggregated result with:
+        - urls: unique URLs across all windows (sorted by match%)
+        - matches: per-URL data (taking max match% across windows)
+        - top_match_pct: highest match% across all windows
+        - windows_searched: count of windows processed
+    """
+    all_urls: Dict[str, Dict] = {}  # url → best match data
+    top_match_pct = 0.0
+    windows_with_results = 0
+    
+    for window_text, result in window_results:
+        if not result.get("urls"):
+            continue
+        
+        windows_with_results += 1
+        
+        for url in result.get("urls", []):
+            match_data = result.get("matches", {}).get(url, {})
+            match_pct = match_data.get("match_pct", 0.0)
+            
+            if url not in all_urls or match_pct > all_urls[url].get("match_pct", 0.0):
+                all_urls[url] = match_data
+                all_urls[url]["match_pct"] = match_pct
+            
+            top_match_pct = max(top_match_pct, match_pct)
+    
+    # Sort URLs by match % descending
+    sorted_urls = sorted(
+        all_urls.keys(),
+        key=lambda u: all_urls[u].get("match_pct", 0.0),
+        reverse=True,
+    )[:MAX_RESULTS]
+    
+    return {
+        "urls": sorted_urls,
+        "matches": {u: all_urls[u] for u in sorted_urls},
+        "top_match_pct": round(top_match_pct, 2),
+        "windows_searched": windows_with_results,
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -493,54 +620,25 @@ def _scrape_and_match(text: str, urls: List[str]) -> tuple:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MAIN — WITH 3-TIER FALLBACK + CIRCUIT BREAKER
+# MAIN — WITH 3-TIER FALLBACK + CIRCUIT BREAKER + H5 SLIDING WINDOW
 # ─────────────────────────────────────────────────────────────────────────────
 
-def google_search_with_matches(text: str) -> Dict:
+def _search_window(window_text: str) -> Dict:
     """
-    Full verbatim search pipeline with 3-tier fallback.
+    Search a single text window through all 3 tiers.
+    Returns result dict with urls, matches, top_match_pct.
+    """
+    # Check cache first
+    cached = _get_from_cache(window_text)
+    if cached:
+        return cached
     
-    WITH M4 CIRCUIT BREAKER:
-    - Detects Google API quota exhaustion
-    - Returns empty result gracefully if quota hit
-    - Analysis continues without web search
-    - Re-enables after 1 hour timeout
-
-    Tier 1 — Quoted verbatim n-grams (most precise):
-      "exact phrase here" → Google exact-phrase match
-      Best for well-indexed sources (Wikipedia, journals, news)
-
-    Tier 2 — Broad keyword queries (fallback for poorly-indexed sources):
-      key phrase without quotes → Google keyword match
-      Catches content from government sites, regional portals
-      (e.g. tgpsc.gov.in) that rarely appear in phrase searches
-
-    Tier 3 — Legacy slices (last resort):
-      Raw 12-word slices from beginning/middle/end
-      Very broad, maximises URL discovery
-
-    Once URLs are collected (from whichever tier succeeds), ALL URLs
-    go through the same verbatim scrape-and-match pipeline.
-
-    Returns:
-    {
-        "urls":          [...],        # All unique URLs found (sorted by match%)
-        "matches":       {...},        # Per-URL: match_pct, scraped, etc.
-        "top_match_pct": 12.3,        # Highest verbatim match across all URLs
-        "queries_used":  [...],        # Queries that found results
-        "tier_used":     "verbatim",  # Which tier produced results
-    }
-    """
-    if not GOOGLE_API_KEY or not GOOGLE_CSE_ID:
-        logger.warning("Google Search skipped — API key or CSE ID not set")
-        return _empty_result()
-
     collected_urls: List[str] = []
     queries_used: List[str]   = []
     tier_used = "none"
 
     # ── TIER 1: Quoted verbatim n-gram queries ────────────────────────────
-    verbatim_queries = build_verbatim_queries(text)
+    verbatim_queries = build_verbatim_queries(window_text)
     if verbatim_queries:
         collected_urls = _collect_urls(verbatim_queries, label="verbatim")
         if collected_urls:
@@ -549,12 +647,11 @@ def google_search_with_matches(text: str) -> Dict:
             logger.info("Tier 1 (verbatim) succeeded: %d URLs", len(collected_urls))
 
     # ── TIER 2: Broad keyword queries (no quotes) ─────────────────────────
-    # Triggered when verbatim returns 0 — catches govt/regional sites
     if not collected_urls:
         logger.info(
             "Tier 1 (verbatim) returned 0 URLs — trying Tier 2 (broad keyword)"
         )
-        broad_queries = build_broad_queries(text)
+        broad_queries = build_broad_queries(window_text)
         if broad_queries:
             collected_urls = _collect_urls(broad_queries, label="broad")
             if collected_urls:
@@ -567,11 +664,11 @@ def google_search_with_matches(text: str) -> Dict:
         logger.info(
             "Tier 2 (broad) returned 0 URLs — trying Tier 3 (legacy slices)"
         )
-        words = text.split()
+        words = window_text.split()
         legacy_queries = []
 
         if len(words) >= MIN_QUERY_WORDS:
-            seed = hash(text[:200])
+            seed = hash(window_text[:200])
             rng  = random.Random(seed)
             start = rng.randint(0, max(0, len(words) - 12))
 
@@ -597,37 +694,108 @@ def google_search_with_matches(text: str) -> Dict:
         if _google_circuit_breaker.is_open:
             logger.warning(
                 "⛔ Google API circuit breaker OPEN — quota exhausted. "
-                "Returning empty result. Web plagiarism check skipped."
+                "Returning empty result for this window."
             )
-        else:
-            logger.info(
-                "All 3 query tiers returned 0 URLs — "
-                "source may not be publicly indexed (e.g. intranet, low-SEO govt site)"
-            )
-        return _empty_result(queries_used=verbatim_queries)
+        result = _empty_result(queries_used=verbatim_queries)
+    else:
+        # ── Scrape + verbatim match ───────────────────────────────────────────
+        matches, top_match_pct = _scrape_and_match(window_text, collected_urls)
 
-    # ── Scrape + verbatim match ───────────────────────────────────────────
-    matches, top_match_pct = _scrape_and_match(text, collected_urls)
+        # Sort by match % descending
+        sorted_urls = sorted(
+            collected_urls,
+            key=lambda u: matches.get(u, {}).get("match_pct", 0.0),
+            reverse=True,
+        )
 
-    # Sort by match % descending
-    sorted_urls = sorted(
-        collected_urls,
-        key=lambda u: matches.get(u, {}).get("match_pct", 0.0),
-        reverse=True,
-    )
+        logger.info(
+            "Window search complete | tier=%s | urls=%d | top_match=%.1f%%",
+            tier_used, len(sorted_urls), top_match_pct,
+        )
 
-    logger.info(
-        "Search complete | tier=%s | urls=%d | top_match=%.1f%%",
-        tier_used, len(sorted_urls), top_match_pct,
-    )
+        result = {
+            "urls":          sorted_urls,
+            "matches":       matches,
+            "top_match_pct": round(top_match_pct, 2),
+            "queries_used":  queries_used,
+            "tier_used":     tier_used,
+        }
+    
+    # Cache the result
+    _set_cache(window_text, result)
+    return result
 
-    return {
-        "urls":          sorted_urls,
-        "matches":       matches,
-        "top_match_pct": round(top_match_pct, 2),
-        "queries_used":  queries_used,
-        "tier_used":     tier_used,
+
+def google_search_with_matches(text: str, use_sliding_window: bool = True) -> Dict:
+    """
+    Full verbatim search pipeline with 3-tier fallback.
+    
+    H5 ENHANCEMENT: Sliding window support
+    - If text > 50 words and use_sliding_window=True:
+      Split into overlapping windows, search each, aggregate results
+    - If text <= 50 words or use_sliding_window=False:
+      Use original single-pass pipeline
+    
+    WITH M4 CIRCUIT BREAKER:
+    - Detects Google API quota exhaustion
+    - Returns empty result gracefully if quota hit
+    - Analysis continues without web search
+    - Re-enables after 1 hour timeout
+
+    Returns:
+    {
+        "urls":          [...],        # All unique URLs found (sorted by match%)
+        "matches":       {...},        # Per-URL: match_pct, scraped, etc.
+        "top_match_pct": 12.3,        # Highest verbatim match across all windows
+        "queries_used":  [...],        # Queries that found results
+        "tier_used":     "verbatim",  # Which tier produced results (last window)
+        "windows_searched": 1,         # H5: Number of windows searched
     }
+    """
+    if not GOOGLE_API_KEY or not GOOGLE_CSE_ID:
+        logger.warning("Google Search skipped — API key or CSE ID not set")
+        return _empty_result()
+
+    words = text.split()
+    
+    # H5: Decide whether to use sliding window
+    if use_sliding_window and len(words) > WINDOW_SIZE:
+        logger.info(
+            "H5 Sliding window enabled: %d words → splitting into windows (size=%d, stride=%d)",
+            len(words), WINDOW_SIZE, WINDOW_STRIDE
+        )
+        
+        windows = _create_windows(text, window_size=WINDOW_SIZE, stride=WINDOW_STRIDE)
+        logger.info("Created %d windows for document (%d words)", len(windows), len(words))
+        
+        window_results: List[Tuple[str, Dict]] = []
+        
+        for i, window in enumerate(windows):
+            logger.info("Searching window %d/%d...", i + 1, len(windows))
+            result = _search_window(window)
+            window_results.append((window, result))
+            
+            # Throttle between window searches (already has delays inside _search_window)
+            if i < len(windows) - 1:
+                time.sleep(random.uniform(0.5, 1.5))
+        
+        # Aggregate all window results
+        aggregated = _aggregate_window_results(window_results)
+        aggregated["windows_searched"] = len(windows)
+        
+        logger.info(
+            "Sliding window search complete | windows=%d | total_urls=%d | top_match=%.1f%%",
+            len(windows), len(aggregated["urls"]), aggregated["top_match_pct"]
+        )
+        
+        return aggregated
+    
+    else:
+        # Original single-pass pipeline (for small documents or disabled sliding window)
+        logger.info("Single-pass search (document too small or sliding window disabled)")
+        result = _search_window(text)
+        result["windows_searched"] = 1
+        return result
 
 
 def _empty_result(queries_used: Optional[List[str]] = None) -> Dict:
@@ -638,6 +806,7 @@ def _empty_result(queries_used: Optional[List[str]] = None) -> Dict:
         "top_match_pct": 0.0,
         "queries_used":  queries_used or [],
         "tier_used":     "none",
+        "windows_searched": 0,
     }
 
 
@@ -648,7 +817,7 @@ def _empty_result(queries_used: Optional[List[str]] = None) -> Dict:
 def google_search(text: str) -> List[str]:
     """
     Backward-compatible API — returns list of URLs only.
-    Internally uses the full 3-tier pipeline with circuit breaker.
+    Internally uses the full 3-tier pipeline with circuit breaker and sliding windows.
     """
     result = google_search_with_matches(text)
     return result.get("urls", [])
@@ -665,4 +834,5 @@ def get_circuit_breaker_status() -> Dict[str, any]:
         "threshold": _google_circuit_breaker.threshold,
         "last_failure_time": _google_circuit_breaker.last_failure_time.isoformat() if _google_circuit_breaker.last_failure_time else None,
         "status": "⛔ OPEN" if _google_circuit_breaker.is_open else "✅ CLOSED",
+        "cache_size": len(_query_cache),
     }

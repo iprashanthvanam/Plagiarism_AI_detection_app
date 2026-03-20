@@ -1,641 +1,3 @@
-# # backend/app/libs/plagiarism.py
-# """
-# ╔══════════════════════════════════════════════════════════════════════════════╗
-# ║           TKREC PLAGIARISM ENGINE — MULTI-METHOD ENSEMBLE                   ║
-# ╠══════════════════════════════════════════════════════════════════════════════╣
-# ║                                                                              ║
-# ║  PREVIOUS VERSION: Single method (bag-of-words cosine, no IDF weighting)    ║
-# ║  THIS VERSION:     5-method ensemble covering all plagiarism types           ║
-# ║                                                                              ║
-# ║  METHOD OVERVIEW                                                             ║
-# ║  ─────────────────────────────────────────────────────────────────────────  ║
-# ║  [A1] TF-IDF Cosine (sklearn)     → vocabulary overlap, proper IDF          ║
-# ║  [A2] Jaccard Word N-gram         → copied phrases, near-duplicate text     ║
-# ║  [A3] Winnowing Fingerprinting    → copy-paste with minor edits/shuffling   ║
-# ║  [A4] Character N-gram Jaccard    → OCR noise, transliteration, typos       ║
-# ║  [B1] Sentence-BERT (SBERT)       → paraphrasing, synonym replacement       ║
-# ║                                                                              ║
-# ║  ENSEMBLE WEIGHTS (tuned for academic plagiarism):                           ║
-# ║    TF-IDF    30%  – strong signal for topic-level copying                   ║
-# ║    Jaccard   25%  – strong signal for phrase-level copying                  ║
-# ║    Winnowing 20%  – strong signal for copy-paste with edits                 ║
-# ║    Char-gram 10%  – supplementary signal for OCR/format variations          ║
-# ║    SBERT     15%  – semantic paraphrasing (gracefully degrades if offline)  ║
-# ║                                                                              ║
-# ║  DESIGN PRINCIPLES                                                           ║
-# ║  ─────────────────────────────────────────────────────────────────────────  ║
-# ║  • Each method score is clamped to [0.0, 1.0] before ensemble               ║
-# ║  • SBERT model lazy-loaded once and cached — no repeat download              ║
-# ║  • If SBERT unavailable (no GPU / no internet), weights redistribute         ║
-# ║  • normalize_scores() kept for backward compat but NOT called by main.py    ║
-# ║    (main.py uses independent axes: AI independent of plagiarism)            ║
-# ║                                                                              ║
-# ╚══════════════════════════════════════════════════════════════════════════════╝
-# """
-
-# from __future__ import annotations
-
-# import re
-# import math
-# import hashlib
-# import logging
-# from typing import List, Optional, Tuple
-# from collections import Counter
-
-# import numpy as np
-
-# logger = logging.getLogger("plagiarism")
-
-# # ─────────────────────────────────────────────────────────────────────────────
-# # CONFIGURATION
-# # ─────────────────────────────────────────────────────────────────────────────
-
-# MIN_TOKENS          = 30    # Minimum tokens to run any comparison
-# MIN_OVERLAP_TOKENS  = 8     # Minimum shared tokens to report non-zero similarity
-# CHAR_NGRAM_SIZE     = 5     # Character n-gram size for method A4
-# WORD_NGRAM_SIZES    = [2, 3] # Word n-gram sizes for method A2
-# WINNOW_K            = 5     # K-gram size for Winnowing fingerprints
-# WINNOW_WINDOW       = 4     # Window size for Winnowing algorithm
-
-# # SBERT model — 'all-MiniLM-L6-v2' is fast (80MB), good quality
-# # Upgrade to 'all-mpnet-base-v2' (420MB) for higher accuracy
-# SBERT_MODEL_NAME = "all-MiniLM-L6-v2"
-
-# # Ensemble weights (must sum to 1.0)
-# ENSEMBLE_WEIGHTS = {
-#     "tfidf":       0.30,
-#     "jaccard":     0.25,
-#     "winnowing":   0.20,
-#     "char_ngram":  0.10,
-#     "sbert":       0.15,
-# }
-
-# # Max score any single method can contribute (prevents false 100%)
-# MAX_SINGLE_SOURCE_WEIGHT = 0.90
-
-
-# # ─────────────────────────────────────────────────────────────────────────────
-# # SBERT MODEL CACHE (lazy-loaded singleton)
-# # ─────────────────────────────────────────────────────────────────────────────
-
-# _sbert_model = None
-# _sbert_available = None   # None = not yet tried, True/False = result
-
-# def _get_sbert_model():
-#     """
-#     Lazy-load SBERT model exactly once per process.
-#     Falls back gracefully if sentence-transformers not installed or no internet.
-#     """
-#     global _sbert_model, _sbert_available
-
-#     if _sbert_available is True:
-#         return _sbert_model
-
-#     if _sbert_available is False:
-#         return None   # Already tried and failed — don't retry
-
-#     try:
-#         from sentence_transformers import SentenceTransformer
-#         logger.info("Loading SBERT model '%s' (first call, cached after)...", SBERT_MODEL_NAME)
-#         _sbert_model = SentenceTransformer(SBERT_MODEL_NAME)
-#         _sbert_available = True
-#         logger.info("SBERT model loaded successfully.")
-#         return _sbert_model
-#     except Exception as e:
-#         _sbert_available = False
-#         logger.warning(
-#             "SBERT unavailable (%s). Semantic similarity disabled. "
-#             "Install: pip install sentence-transformers", e
-#         )
-#         return None
-
-
-# # ─────────────────────────────────────────────────────────────────────────────
-# # TEXT NORMALIZATION
-# # ─────────────────────────────────────────────────────────────────────────────
-
-# def normalize_text(text: str) -> List[str]:
-#     """
-#     Normalize to lowercase word tokens.
-#     Strips punctuation, collapses whitespace.
-#     Works for English + transliterated Indic text.
-#     """
-#     if not text:
-#         return []
-#     text = text.lower()
-#     text = re.sub(r"[^a-z0-9\s]", " ", text)
-#     text = re.sub(r"\s+", " ", text).strip()
-#     return text.split()
-
-
-# def normalize_preserve_unicode(text: str) -> str:
-#     """
-#     Lighter normalization for character n-grams:
-#     lowercase, collapse whitespace, keep Unicode characters
-#     (important for Telugu/Hindi text).
-#     """
-#     if not text:
-#         return ""
-#     text = text.lower()
-#     text = re.sub(r"\s+", " ", text).strip()
-#     return text
-
-
-# # ─────────────────────────────────────────────────────────────────────────────
-# # METHOD A1 — TF-IDF COSINE SIMILARITY (sklearn)
-# # ─────────────────────────────────────────────────────────────────────────────
-# # Why better than old cosine:
-# #   Old code used raw term frequency (Counter) — common words like "the", "is"
-# #   dominated the similarity score.
-# #   sklearn TfidfVectorizer applies IDF weighting, so rare/distinctive words
-# #   contribute more, common function words contribute less.
-# #   Also uses sublinear_tf=True (log normalization) for further robustness.
-
-# def tfidf_similarity(source: str, targets: List[str]) -> float:
-#     """
-#     Compute max TF-IDF cosine similarity between source and any target document.
-#     Uses sklearn's TfidfVectorizer with word 1-3 grams and IDF weighting.
-
-#     Returns: similarity in [0.0, 1.0]
-#     """
-#     if not source or not targets:
-#         return 0.0
-
-#     try:
-#         from sklearn.feature_extraction.text import TfidfVectorizer
-#         from sklearn.metrics.pairwise import cosine_similarity as sk_cosine
-
-#         all_docs = [source] + targets
-
-#         vectorizer = TfidfVectorizer(
-#             analyzer="word",
-#             ngram_range=(1, 2),       # unigrams + bigrams
-#             sublinear_tf=True,         # log(1 + tf) — prevents large tf domination
-#             min_df=1,
-#             strip_accents="unicode",
-#             stop_words=None,           # Keep all words — plagiarists use same stopwords
-#         )
-
-#         tfidf_matrix = vectorizer.fit_transform(all_docs)
-#         source_vec = tfidf_matrix[0]
-#         target_vecs = tfidf_matrix[1:]
-
-#         sims = sk_cosine(source_vec, target_vecs)[0]
-#         return float(np.max(sims)) if len(sims) > 0 else 0.0
-
-#     except ImportError:
-#         logger.warning("scikit-learn not available — TF-IDF method skipped")
-#         return 0.0
-#     except Exception as e:
-#         logger.warning("TF-IDF similarity failed: %s", e)
-#         return 0.0
-
-
-# # ─────────────────────────────────────────────────────────────────────────────
-# # METHOD A2 — JACCARD WORD N-GRAM SIMILARITY
-# # ─────────────────────────────────────────────────────────────────────────────
-# # Why useful:
-# #   Jaccard = |intersection| / |union| over sets of n-grams.
-# #   Word bigrams ("machine learning", "text analysis") catch copied phrases
-# #   better than individual words because plagiarists may synonym-swap single words
-# #   but rarely rephrase entire phrases.
-# #   Trigrams add even more specificity for phrase-level copying.
-
-# def word_ngrams(tokens: List[str], n: int) -> set:
-#     """Extract all word n-grams as tuples from a token list."""
-#     if len(tokens) < n:
-#         return set()
-#     return set(tuple(tokens[i:i+n]) for i in range(len(tokens) - n + 1))
-
-
-# def jaccard_ngram_similarity(source_tokens: List[str], target_tokens: List[str]) -> float:
-#     """
-#     Jaccard similarity over word 2-grams and 3-grams, averaged.
-#     Higher weight to bigrams (more common in paraphrasing).
-#     """
-#     if not source_tokens or not target_tokens:
-#         return 0.0
-
-#     scores = []
-#     weights = []
-
-#     for n, w in zip(WORD_NGRAM_SIZES, [0.6, 0.4]):  # bigrams 60%, trigrams 40%
-#         src_grams = word_ngrams(source_tokens, n)
-#         tgt_grams = word_ngrams(target_tokens, n)
-
-#         if not src_grams or not tgt_grams:
-#             continue
-
-#         intersection = len(src_grams & tgt_grams)
-#         union        = len(src_grams | tgt_grams)
-
-#         if union == 0:
-#             continue
-
-#         scores.append(intersection / union)
-#         weights.append(w)
-
-#     if not scores:
-#         return 0.0
-
-#     # Weighted average
-#     total_w = sum(weights)
-#     return sum(s * w for s, w in zip(scores, weights)) / total_w
-
-
-# def jaccard_similarity_max(source: str, targets: List[str]) -> float:
-#     """Run Jaccard N-gram similarity against all targets, return max."""
-#     src_tokens = normalize_text(source)
-#     if len(src_tokens) < MIN_TOKENS:
-#         return 0.0
-
-#     max_sim = 0.0
-#     for target in targets:
-#         tgt_tokens = normalize_text(target)
-#         if len(tgt_tokens) < MIN_TOKENS:
-#             continue
-#         sim = jaccard_ngram_similarity(src_tokens, tgt_tokens)
-#         max_sim = max(max_sim, sim)
-
-#     return max_sim
-
-
-# # ─────────────────────────────────────────────────────────────────────────────
-# # METHOD A3 — WINNOWING FINGERPRINT SIMILARITY
-# # ─────────────────────────────────────────────────────────────────────────────
-# # Why useful:
-# #   Winnowing is the algorithm used in MOSS (Measure Of Software Similarity),
-# #   Stanford's academic plagiarism detector. It works by:
-# #   1. Breaking text into overlapping k-grams (substrings of k tokens)
-# #   2. Hashing each k-gram
-# #   3. Sliding a window over the hashes, keeping only the minimum hash per window
-# #   4. The "fingerprint" = set of selected minimum hashes
-# #   5. Similarity = |fingerprint intersection| / |fingerprint union|
-# #
-# #   Key advantage: robust to copy-paste with insertions, deletions, or
-# #   sentence reordering — the fingerprint "survives" these edits.
-
-# def rolling_hash(tokens: List[str], k: int) -> List[int]:
-#     """Compute rolling hash for all k-grams in token list."""
-#     hashes = []
-#     for i in range(len(tokens) - k + 1):
-#         kgram = " ".join(tokens[i:i+k])
-#         # Use SHA-256 truncated to int — deterministic, collision-resistant
-#         h = int(hashlib.sha256(kgram.encode()).hexdigest(), 16) % (10**9)
-#         hashes.append(h)
-#     return hashes
-
-
-# def winnow(tokens: List[str], k: int = WINNOW_K, w: int = WINNOW_WINDOW) -> set:
-#     """
-#     Winnowing algorithm:
-#     - Compute k-gram hashes
-#     - Slide window of size w, select minimum hash per window
-#     - Return set of selected hashes (the document fingerprint)
-#     """
-#     hashes = rolling_hash(tokens, k)
-#     if not hashes:
-#         return set()
-
-#     fingerprint = set()
-#     for i in range(len(hashes) - w + 1):
-#         window = hashes[i:i+w]
-#         fingerprint.add(min(window))
-
-#     return fingerprint
-
-
-# def winnowing_similarity(source_tokens: List[str], target_tokens: List[str]) -> float:
-#     """
-#     Winnowing fingerprint Jaccard similarity between two token lists.
-#     Returns similarity in [0.0, 1.0].
-#     """
-#     if len(source_tokens) < WINNOW_K or len(target_tokens) < WINNOW_K:
-#         return 0.0
-
-#     fp_src = winnow(source_tokens)
-#     fp_tgt = winnow(target_tokens)
-
-#     if not fp_src or not fp_tgt:
-#         return 0.0
-
-#     intersection = len(fp_src & fp_tgt)
-#     union        = len(fp_src | fp_tgt)
-
-#     return intersection / union if union > 0 else 0.0
-
-
-# def winnowing_similarity_max(source: str, targets: List[str]) -> float:
-#     """Run Winnowing fingerprint similarity against all targets, return max."""
-#     src_tokens = normalize_text(source)
-#     if len(src_tokens) < WINNOW_K:
-#         return 0.0
-
-#     max_sim = 0.0
-#     for target in targets:
-#         tgt_tokens = normalize_text(target)
-#         if len(tgt_tokens) < WINNOW_K:
-#             continue
-#         sim = winnowing_similarity(src_tokens, tgt_tokens)
-#         max_sim = max(max_sim, sim)
-
-#     return max_sim
-
-
-# # ─────────────────────────────────────────────────────────────────────────────
-# # METHOD A4 — CHARACTER N-GRAM JACCARD SIMILARITY
-# # ─────────────────────────────────────────────────────────────────────────────
-# # Why useful:
-# #   Character n-grams are language-independent and robust to:
-# #   • Spelling variations / typos
-# #   • OCR errors (common in scanned PDFs)
-# #   • Transliteration differences (same word spelled differently)
-# #   • Morphological variations (plurals, tense changes)
-# #   For Telugu/Hindi text especially — character 5-grams catch shared
-# #   script patterns even when normalization strips Unicode.
-
-# def char_ngrams(text: str, n: int = CHAR_NGRAM_SIZE) -> set:
-#     """Extract character n-grams from text."""
-#     text = normalize_preserve_unicode(text)
-#     if len(text) < n:
-#         return set()
-#     return set(text[i:i+n] for i in range(len(text) - n + 1))
-
-
-# def char_ngram_similarity(source: str, target: str) -> float:
-#     """Jaccard similarity over character 5-grams."""
-#     src_grams = char_ngrams(source)
-#     tgt_grams = char_ngrams(target)
-
-#     if not src_grams or not tgt_grams:
-#         return 0.0
-
-#     intersection = len(src_grams & tgt_grams)
-#     union        = len(src_grams | tgt_grams)
-
-#     return intersection / union if union > 0 else 0.0
-
-
-# def char_ngram_similarity_max(source: str, targets: List[str]) -> float:
-#     """Run character N-gram similarity against all targets, return max."""
-#     if not source or len(source) < CHAR_NGRAM_SIZE:
-#         return 0.0
-
-#     max_sim = 0.0
-#     for target in targets:
-#         sim = char_ngram_similarity(source, target)
-#         max_sim = max(max_sim, sim)
-
-#     return max_sim
-
-
-# # ─────────────────────────────────────────────────────────────────────────────
-# # METHOD B1 — SENTENCE-BERT SEMANTIC SIMILARITY
-# # ─────────────────────────────────────────────────────────────────────────────
-# # Why useful:
-# #   SBERT encodes each document into a dense 384-dimensional vector using
-# #   a pretrained transformer (MiniLM fine-tuned on semantic textual similarity).
-# #   Two documents that express the SAME IDEAS in different words will have
-# #   high cosine similarity in this embedding space.
-# #
-# #   This is the only method that detects paraphrasing — where a plagiarist
-# #   rewrites sentences with synonyms or restructures paragraphs.
-# #   All lexical methods (A1-A4) miss this. SBERT catches it.
-# #
-# #   Model used: all-MiniLM-L6-v2
-# #   Size: ~80MB (downloaded once, cached at ~/.cache/huggingface/)
-# #   Speed: ~50ms per document pair on CPU, ~5ms on GPU
-# #
-# #   Fallback: if not installed or no internet, score = 0.0 and ensemble
-# #   redistributes its 15% weight to other methods.
-
-# def _cosine_np(a: np.ndarray, b: np.ndarray) -> float:
-#     """Fast cosine similarity using numpy."""
-#     denom = np.linalg.norm(a) * np.linalg.norm(b)
-#     if denom == 0:
-#         return 0.0
-#     return float(np.dot(a, b) / denom)
-
-
-# def sbert_similarity_max(source: str, targets: List[str]) -> Tuple[float, bool]:
-#     """
-#     Compute max SBERT cosine similarity between source and all targets.
-
-#     Returns: (score 0.0-1.0, was_available: bool)
-#     was_available=False means SBERT is not installed — caller redistributes weight.
-
-#     NOTE: SBERT cosine between two academic papers on the SAME topic is typically
-#     0.60-0.75 even if they share no copied text (they just discuss the same ideas).
-#     The noise floor for SBERT is therefore 0.60 — scores below that are zeroed.
-#     """
-#     model = _get_sbert_model()
-#     if model is None:
-#         return 0.0, False
-
-#     if not source or not targets:
-#         return 0.0, True
-
-#     try:
-#         # Truncate very long documents — SBERT has 512 token limit
-#         src_text = source[:4000]
-#         tgt_texts = [t[:4000] for t in targets if t]
-
-#         if not tgt_texts:
-#             return 0.0, True
-
-#         all_texts = [src_text] + tgt_texts
-#         embeddings = model.encode(all_texts, convert_to_numpy=True, show_progress_bar=False)
-
-#         src_emb  = embeddings[0]
-#         tgt_embs = embeddings[1:]
-
-#         sims = [_cosine_np(src_emb, tgt) for tgt in tgt_embs]
-#         max_sim = max(sims) if sims else 0.0
-
-#         return float(max(0.0, max_sim)), True
-
-#     except Exception as e:
-#         logger.warning("SBERT inference failed: %s", e)
-#         return 0.0, True
-
-
-# # ─────────────────────────────────────────────────────────────────────────────
-# # WEIGHT REDISTRIBUTION (when SBERT unavailable)
-# # ─────────────────────────────────────────────────────────────────────────────
-
-# def _redistribute_weights(weights: dict, skip_key: str) -> dict:
-#     """
-#     Remove skip_key from weights and redistribute its weight proportionally.
-#     """
-#     skip_w = weights[skip_key]
-#     remaining = {k: v for k, v in weights.items() if k != skip_key}
-#     total_remaining = sum(remaining.values())
-
-#     if total_remaining == 0:
-#         return remaining
-
-#     factor = (total_remaining + skip_w) / total_remaining
-#     return {k: v * factor for k, v in remaining.items()}
-
-
-# # ─────────────────────────────────────────────────────────────────────────────
-# # WEIGHTED ENSEMBLE SCORE
-# # ─────────────────────────────────────────────────────────────────────────────
-
-# def ensemble_plagiarism_score(source: str, targets: List[str]) -> dict:
-#     """
-#     Run all 5 plagiarism detection methods, apply noise floors, combine into
-#     a weighted score, and apply calibration curve to match Turnitin output.
-
-#     Returns a dict with:
-#       - 'score':          final calibrated score (0.0 – 100.0)
-#       - 'raw_score':      pre-calibration ensemble score (for debugging)
-#       - 'breakdown':      per-method raw scores (before noise floor)
-#       - 'breakdown_adj':  per-method scores after noise floor removal
-#       - 'methods':        which methods ran successfully
-#     """
-#     if not source or not targets:
-#         return {"score": 0.0, "raw_score": 0.0, "breakdown": {}, "breakdown_adj": {}, "methods": []}
-
-#     src_tokens = normalize_text(source)
-#     if len(src_tokens) < MIN_TOKENS:
-#         logger.debug("Source too short (%d tokens) — skipping ensemble", len(src_tokens))
-#         return {"score": 0.0, "raw_score": 0.0, "breakdown": {}, "breakdown_adj": {}, "methods": []}
-
-#     # Filter out targets that are too short
-#     valid_targets = [t for t in targets if len(normalize_text(t)) >= MIN_TOKENS]
-#     if not valid_targets:
-#         return {"score": 0.0, "raw_score": 0.0, "breakdown": {}, "breakdown_adj": {}, "methods": []}
-
-#     breakdown     = {}
-#     breakdown_adj = {}
-#     weights       = dict(ENSEMBLE_WEIGHTS)
-#     sbert_ran     = True
-
-#     # ── A1: TF-IDF ────────────────────────────────────────────────────────
-#     raw_tfidf = tfidf_similarity(source, valid_targets)
-#     raw_tfidf = min(raw_tfidf, MAX_SINGLE_SOURCE_WEIGHT)
-#     adj_tfidf = _apply_noise_floor(raw_tfidf, "tfidf")
-#     breakdown["tfidf"]     = round(raw_tfidf * 100, 2)
-#     breakdown_adj["tfidf"] = round(adj_tfidf * 100, 2)
-
-#     # ── A2: Jaccard N-gram ────────────────────────────────────────────────
-#     raw_jaccard = jaccard_similarity_max(source, valid_targets)
-#     raw_jaccard = min(raw_jaccard, MAX_SINGLE_SOURCE_WEIGHT)
-#     adj_jaccard = _apply_noise_floor(raw_jaccard, "jaccard")
-#     breakdown["jaccard"]     = round(raw_jaccard * 100, 2)
-#     breakdown_adj["jaccard"] = round(adj_jaccard * 100, 2)
-
-#     # ── A3: Winnowing Fingerprint ─────────────────────────────────────────
-#     raw_winnow = winnowing_similarity_max(source, valid_targets)
-#     raw_winnow = min(raw_winnow, MAX_SINGLE_SOURCE_WEIGHT)
-#     adj_winnow = _apply_noise_floor(raw_winnow, "winnowing")
-#     breakdown["winnowing"]     = round(raw_winnow * 100, 2)
-#     breakdown_adj["winnowing"] = round(adj_winnow * 100, 2)
-
-#     # ── A4: Character N-gram ──────────────────────────────────────────────
-#     raw_char = char_ngram_similarity_max(source, valid_targets)
-#     raw_char = min(raw_char, MAX_SINGLE_SOURCE_WEIGHT)
-#     adj_char = _apply_noise_floor(raw_char, "char_ngram")
-#     breakdown["char_ngram"]     = round(raw_char * 100, 2)
-#     breakdown_adj["char_ngram"] = round(adj_char * 100, 2)
-
-#     # ── B1: Sentence-BERT ─────────────────────────────────────────────────
-#     raw_sbert, sbert_available = sbert_similarity_max(source, valid_targets)
-#     if sbert_available:
-#         raw_sbert = min(raw_sbert, MAX_SINGLE_SOURCE_WEIGHT)
-#         adj_sbert = _apply_noise_floor(raw_sbert, "sbert")
-#         breakdown["sbert"]     = round(raw_sbert * 100, 2)
-#         breakdown_adj["sbert"] = round(adj_sbert * 100, 2)
-#     else:
-#         breakdown["sbert"]     = None
-#         breakdown_adj["sbert"] = None
-#         weights = _redistribute_weights(weights, "sbert")
-#         sbert_ran = False
-
-#     # ── Weighted ensemble (on noise-floor-adjusted scores) ────────────────
-#     method_scores_adj = {
-#         "tfidf":      adj_tfidf,
-#         "jaccard":    adj_jaccard,
-#         "winnowing":  adj_winnow,
-#         "char_ngram": adj_char,
-#     }
-#     if sbert_ran:
-#         method_scores_adj["sbert"] = adj_sbert
-
-#     raw_ensemble = sum(method_scores_adj[k] * weights[k] for k in method_scores_adj)
-#     raw_ensemble_pct = min(100.0, max(0.0, raw_ensemble * 100))
-
-#     # ── Apply calibration curve ───────────────────────────────────────────
-#     calibrated_score = _apply_calibration_curve(raw_ensemble_pct)
-
-#     methods_used = list(method_scores_adj.keys())
-
-#     logger.info(
-#         "Plagiarism | raw=%.1f%% calibrated=%.1f%% | "
-#         "tfidf=%.1f%%(adj=%.1f%%) jaccard=%.1f%%(adj=%.1f%%) "
-#         "winnow=%.1f%%(adj=%.1f%%) char=%.1f%%(adj=%.1f%%) sbert=%s",
-#         raw_ensemble_pct, calibrated_score,
-#         breakdown["tfidf"],     breakdown_adj["tfidf"],
-#         breakdown["jaccard"],   breakdown_adj["jaccard"],
-#         breakdown["winnowing"], breakdown_adj["winnowing"],
-#         breakdown["char_ngram"],breakdown_adj["char_ngram"],
-#         f"{breakdown['sbert']}%" if sbert_ran else "N/A",
-#     )
-
-#     return {
-#         "score":         round(calibrated_score, 2),
-#         "raw_score":     round(raw_ensemble_pct, 2),
-#         "breakdown":     breakdown,
-#         "breakdown_adj": breakdown_adj,
-#         "methods":       methods_used,
-#     }
-
-
-# # ─────────────────────────────────────────────────────────────────────────────
-# # PUBLIC API — BACKWARD COMPATIBLE WITH main.py
-# # ─────────────────────────────────────────────────────────────────────────────
-# # These are the exact function signatures main.py calls.
-# # Internally they now use the 5-method ensemble.
-
-# async def local_plagiarism_score(
-#     text: str, 
-#     comparison_texts: Optional[List[str]] = None,
-#     db_service = None
-# ) -> float:
-#     """
-#     Compute plagiarism score against internal database.
-    
-#     If comparison_texts is None, fetches from DB with pagination.
-#     """
-#     if not text or len(text.split()) < MIN_TOKENS:
-#         return 0.0
-    
-#     # If no texts provided, fetch from DB (paginated)
-#     if comparison_texts is None and db_service:
-#         comparison_texts = []
-#         page_size = 100
-#         offset = 0
-        
-#         while True:
-#             batch = await db_service.get_similar_documents_paginated(
-#                 exclude_id=0,  # adjust based on context
-#                 limit=page_size,
-#                 offset=offset
-#             )
-            
-#             if not batch:
-#                 break
-            
-#             comparison_texts.extend([doc["text"] for doc in batch])
-            
-#             if len(batch) < page_size:
-#                 break  # Last page
-            
-#             offset += page_size
-    
-#     # ... rest of comparison logic ...
-# ```
 
 # backend/app/libs/plagiarism.py
 """
@@ -704,6 +66,8 @@ from typing import List, Optional, Tuple, Dict
 from collections import Counter
 
 import numpy as np
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
 
 logger = logging.getLogger("plagiarism")
 
@@ -916,9 +280,6 @@ def tfidf_similarity(source: str, targets: List[str]) -> float:
         return 0.0
 
     try:
-        from sklearn.feature_extraction.text import TfidfVectorizer
-        from sklearn.metrics.pairwise import cosine_similarity as sk_cosine
-
         all_docs = [source] + targets
 
         vectorizer = TfidfVectorizer(
@@ -934,12 +295,9 @@ def tfidf_similarity(source: str, targets: List[str]) -> float:
         source_vec = tfidf_matrix[0]
         target_vecs = tfidf_matrix[1:]
 
-        sims = sk_cosine(source_vec, target_vecs)[0]
+        sims = cosine_similarity(source_vec, target_vecs)
         return float(np.max(sims)) if len(sims) > 0 else 0.0
 
-    except ImportError:
-        logger.warning("scikit-learn not available — TF-IDF method skipped")
-        return 0.0
     except Exception as e:
         logger.warning("TF-IDF similarity failed: %s", e)
         return 0.0
@@ -1543,3 +901,85 @@ def length_weighted_similarity(
     cosine   = cosine_similarity(source_tokens, target_tokens)
     coverage = len(overlap) / len(source_tokens)
     return min(cosine * coverage, MAX_SINGLE_SOURCE_WEIGHT)
+
+
+async def compute_sentence_source_map(
+    text: str,
+    web_source_texts: List[str],
+    web_source_urls: Optional[List[str]] = None,
+) -> dict:
+    """
+    For each sentence in the document, find which web source (if any) 
+    has the highest similarity.
+    
+    Returns a dict mapping sentence text → source index (0-based):
+      {
+        "The machine learning model was trained...": 0,
+        "We used a dataset of 10000 examples...": 1,
+        "Results show 95% accuracy on test set": 0,
+        ...
+      }
+    
+    If no web_source_urls provided, uses range(len(web_source_texts)) as indices.
+    Sentences with no significant match are omitted from the map.
+    
+    Args:
+        text: Full extracted document text
+        web_source_texts: List of scraped web page texts
+        web_source_urls: Optional list of URLs corresponding to web_source_texts
+                        (used for logging/debugging)
+    
+    Returns:
+        Dict mapping sentence → source_index
+    """
+    if not text or not web_source_texts:
+        return {}
+    
+    # Split text into sentences (simple heuristic)
+    sentences = _split_sentences(text)
+    if not sentences:
+        return {}
+    
+    sentence_map = {}
+    
+    for sentence in sentences:
+        trimmed = sentence.strip()
+        if len(trimmed.split()) < 3:  # Skip very short sentences
+            continue
+        
+        # Find which source has highest similarity to this sentence
+        max_sim = 0.0
+        best_source_idx = -1
+        
+        for src_idx, source_text in enumerate(web_source_texts):
+            # Use TF-IDF similarity for sentence-to-source matching
+            sim = tfidf_similarity(trimmed, [source_text])
+            if sim > max_sim:
+                max_sim = sim
+                best_source_idx = src_idx
+        
+        # Only record if similarity exceeds threshold (avoid noise)
+        if max_sim >= 0.30:  # 30% similarity = meaningful match
+            sentence_map[trimmed] = best_source_idx
+    
+    logger.debug("Computed sentence map: %d sentences matched", len(sentence_map))
+    return sentence_map
+
+
+def _split_sentences(text: str) -> List[str]:
+    """
+    Split text into sentences using simple regex heuristic.
+    Handles both Latin and Indic punctuation.
+    """
+    import re
+    
+    # Handle both Latin (. ! ?) and Indic (। ॥) sentence endings
+    sentence_re = r'(?<=[.!?।॥])\s+|(?<=[.!?।॥])$'
+    sentences = re.split(sentence_re, text)
+    
+    # Filter: keep sentences with at least 3 words
+    return [
+        s.strip() 
+        for s in sentences 
+        if s.strip() and len(s.strip().split()) >= 3
+    ]
