@@ -71,6 +71,71 @@ Academic institutions face a growing challenge: traditional plagiarism checkers 
 
 ---
 
+## Screenshots
+
+A complete visual walkthrough of every screen in IntellShield.
+
+---
+
+### 🔐 Login Page
+
+<div align="center">
+  <img src="Images/Login.png" alt="IntellShield — Login Page" width="860"/>
+  <br/><br/>
+  <sub><b>Secure login with JWT authentication.</b> Role-based routing sends admins to the Admin Dashboard and students to their personal submission portal.</sub>
+</div>
+
+---
+
+### 🛠️ Admin Dashboard
+
+<div align="center">
+  <img src="Images/Admin Dashboard.png" alt="IntellShield — Admin Dashboard" width="860"/>
+  <br/><br/>
+  <sub><b>Institution-wide admin view.</b> Monitor all submitted documents across every student, review scores, and manage the system.</sub>
+</div>
+
+---
+
+### 🎓 Student Dashboard
+
+<div align="center">
+  <img src="Images/Student Dashboard.png" alt="IntellShield — Student Dashboard" width="860"/>
+  <br/><br/>
+  <sub><b>Student submission portal.</b> Upload documents, track analysis status in real time, and access all previous reports — all in one place.</sub>
+</div>
+
+---
+
+### 🔬 Analysis Page
+
+<div align="center">
+  <img src="Images/Analysis page.png" alt="IntellShield — Analysis Page" width="860"/>
+  <br/><br/>
+  <sub><b>Live analysis engine.</b> View plagiarism score, AI content probability, per-source URL match percentages, and the full AI method breakdown in a single panel.</sub>
+</div>
+
+---
+
+### 📄 Analysis Report — Page 1
+
+<div align="center">
+  <img src="Images/Plagiarism and AI content analysis Report.png" alt="IntellShield — Analysis Report Page 1" width="860"/>
+  <br/><br/>
+  <sub><b>Downloadable PDF report — Page 1.</b> Summarises the overall plagiarism score, AI detection score, document metadata.</sub>
+</div>
+
+---
+
+### 📄 Analysis Report — Page 2
+
+<div align="center">
+  <img src="Images/Plagiarism and AI content analysis Report2.png" alt="IntellShield — Analysis Report Page 2" width="860"/>
+  <br/><br/>
+  <sub><b>Downloadable PDF report — Page 2.</b>  All detected source URLs with individual match percentages.</sub>
+</div>
+
+---
 ## Key Features
 
 ### 🔍 Core Detection
@@ -734,3 +799,4 @@ Built with ❤️ for TKREC
 ⭐ Star this repo if IntellShield helped you!
 
 </div>
+
