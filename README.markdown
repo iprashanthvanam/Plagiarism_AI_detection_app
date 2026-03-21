@@ -34,10 +34,12 @@
   <summary>📑 Table of Contents</summary>
   <ol>
     <li><a href="#about-the-project">About The Project</a></li>
+    <li><a href="#screenshots">Screenshots</a></li>
     <li><a href="#key-features">Key Features</a></li>
     <li><a href="#tech-stack">Tech Stack</a></li>
     <li><a href="#system-architecture">System Architecture</a></li>
     <li><a href="#ai-detection-engine">AI Detection Engine (6-Method Ensemble)</a></li>
+    <li><a href="#plagiarism-pipeline">Plagiarism Detection Pipeline</a></li>
     <li><a href="#getting-started">Getting Started</a></li>
     <li><a href="#environment-variables">Environment Variables</a></li>
     <li><a href="#database-setup">Database Setup & Seeding</a></li>
