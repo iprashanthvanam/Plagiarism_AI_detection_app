@@ -767,11 +767,47 @@ Distributed under the MIT License. See `LICENSE` for more information.
 
 ## Contact
 
-**Prashanth Vanam**
+<div align="center">
 
-[![GitHub](https://img.shields.io/badge/GitHub-iprashanthvanam-181717?style=flat-square&logo=github)](https://github.com/iprashanthvanam)
+### Prashanth Vanam
 
-Project Link: [https://github.com/iprashanthvanam/Plagiarism_AI_detection_app](https://github.com/iprashanthvanam/Plagiarism_AI_detection_app)
+<p>
+  <a href="mailto:prashanthvanamnetha@gmail.com">
+    <img src="https://img.shields.io/badge/Gmail-prashanthvanamnetha%40gmail.com-D14836?style=for-the-badge&logo=gmail&logoColor=white"/>
+  </a>
+  &nbsp;
+  <a href="https://www.linkedin.com/in/iprashanthvanam/">
+    <img src="https://img.shields.io/badge/LinkedIn-iprashanthvanam-0077B5?style=for-the-badge&logo=linkedin&logoColor=white"/>
+  </a>
+  &nbsp;
+  <a href="https://github.com/iprashanthvanam">
+    <img src="https://img.shields.io/badge/GitHub-iprashanthvanam-181717?style=for-the-badge&logo=github&logoColor=white"/>
+  </a>
+</p>
+
+<p>
+  <img src="https://img.shields.io/badge/📍%20Location-Hyderabad%2C%20India-f59e0b?style=for-the-badge"/>
+  &nbsp;
+  <img src="https://img.shields.io/badge/📞%20Mobile-%2B91%2070361%2042499-25D366?style=for-the-badge"/>
+</p>
+
+</div>
+
+<br/>
+
+| | |
+|---|---|
+| 📧 **Email** | [prashanthvanamnetha@gmail.com](mailto:prashanthvanamnetha@gmail.com) |
+| 💼 **LinkedIn** | [linkedin.com/in/iprashanthvanam](https://www.linkedin.com/in/iprashanthvanam/) |
+| 🐙 **GitHub** | [github.com/iprashanthvanam](https://github.com/iprashanthvanam) |
+| 📍 **Location** | Hyderabad, Telangana, India |
+| 📞 **Mobile** | +91 703 6142 499 |
+
+<br/>
+
+> 💬 Feel free to reach out for collaborations, questions, or just to say hi!
+
+**Project Link:** [https://github.com/iprashanthvanam/Plagiarism_AI_detection_app](https://github.com/iprashanthvanam/Plagiarism_AI_detection_app)
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
 
