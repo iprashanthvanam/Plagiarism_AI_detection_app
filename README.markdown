@@ -134,7 +134,7 @@ Academic institutions face a growing challenge: traditional plagiarism checkers 
 │  /auth/login  │  /upload  │  /analyze  │  /status  │  /results  │
 │                                                                 │
 │  ┌──────────┐   ┌─────────────┐   ┌────────────────────────┐    │
-│  │   Auth   │   │ Rate Limiter│   │  Role-Based Access     │   │
+│  │   Auth   │   │ Rate Limiter│   │  Role-Based Access     │    │
 │  │  (JWT)   │   │  (SlowAPI)  │   │  (admin / student)     │    │
 │  └──────────┘   └─────────────┘   └────────────────────────┘    │
 └─────────────────────────┬───────────────────────────────────────┘
