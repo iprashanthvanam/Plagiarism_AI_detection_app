@@ -1,4 +1,3 @@
-
 # backend/app/libs/plagiarism.py
 """
 ╔═════════════════════════════════════════════════════════════════════════════╗
@@ -67,7 +66,7 @@ from collections import Counter
 
 import numpy as np
 from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.metrics.pairwise import cosine_similarity as sklearn_cosine_similarity
 
 logger = logging.getLogger("plagiarism")
 
@@ -295,8 +294,10 @@ def tfidf_similarity(source: str, targets: List[str]) -> float:
         source_vec = tfidf_matrix[0]
         target_vecs = tfidf_matrix[1:]
 
-        sims = cosine_similarity(source_vec, target_vecs)
-        return float(np.max(sims)) if len(sims) > 0 else 0.0
+        sims = sklearn_cosine_similarity(source_vec, target_vecs)
+        # sims is a 2D numpy array shape (1, n_targets) — flatten before max
+        sims_flat = sims.flatten()
+        return float(np.max(sims_flat)) if sims_flat.size > 0 else 0.0
 
     except Exception as e:
         logger.warning("TF-IDF similarity failed: %s", e)
@@ -838,7 +839,9 @@ def web_plagiarism_score(
     if not web_source_texts:
         return 0.0
 
-    return local_plagiarism_score(text, web_source_texts)
+    # Use ensemble directly (sync) — local_plagiarism_score is async, can't call here
+    result = ensemble_plagiarism_score(text, web_source_texts)
+    return result["score"]
 
 
 # ─────────────────────────────────────────────────────────────────────────────

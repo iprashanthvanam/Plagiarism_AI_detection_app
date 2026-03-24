@@ -482,3 +482,35 @@ def start_retention_scheduler():
     scheduler.start()
     logger.info("Retention scheduler started")
     return scheduler
+
+
+
+
+
+async def store_task_id(self, document_id: int, task_id: str) -> bool:
+    """Store Celery task_id on the document row for polling via /analysis-status."""
+    async with self.pool.acquire() as conn:
+        result = await conn.execute(
+            "UPDATE documents SET task_id = $1 WHERE id = $2",
+            task_id, document_id
+        )
+        return result == "UPDATE 1"
+
+async def get_document(self, document_id: int) -> Optional[dict]:
+    """
+    EXISTING METHOD — make sure it includes task_id in SELECT.
+    If your current SELECT uses SELECT * it already works.
+    If it lists columns explicitly, add task_id to the list.
+    Example:
+    """
+    async with self.pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT id, user_id, file_name, content_type, size,
+                   file_path, extracted_text, upload_date, task_id
+            FROM documents
+            WHERE id = $1
+            """,
+            document_id
+        )
+        return dict(row) if row else None

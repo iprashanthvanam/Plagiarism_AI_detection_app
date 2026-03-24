@@ -672,7 +672,13 @@ async def analyze(request: Request, document_id: int, user=Depends(get_current_u
     # ── Enqueue background task ──────────────────────────────────────────
     # This returns immediately and runs in a separate Celery worker process
     task = run_analysis.delay(document_id, user["id"])
-    
+
+    # ── Store task_id on the document so /analysis-status can find it ────
+    try:
+        await db_service.store_task_id(document_id, task.id)
+    except Exception:
+        pass  # Non-critical — /task-status/{task_id} still works
+
     logger.info(
         "Analysis task queued for document %d | task_id=%s | user=%s",
         document_id,
@@ -684,6 +690,7 @@ async def analyze(request: Request, document_id: int, user=Depends(get_current_u
         "success": True,
         "status": "queued",
         "task_id": task.id,
+        "document_id": document_id,
         "message": "Analysis queued. Poll /task-status/{task_id} for progress.",
     }
 
@@ -780,8 +787,10 @@ async def task_status(request: Request, task_id: str, user=Depends(get_current_u
 @limiter.limit(RATE_LIMIT_STATUS)
 async def analysis_status(request: Request, document_id: int, user=Depends(get_current_user)):
     """
-    DEPRECATED: Use /task-status/{task_id} instead.
-    Kept for backward compatibility.
+    Poll analysis status by document_id.
+    Checks Celery task state first (via stored task_id on the document row),
+    then falls back to DB result when the task is complete.
+    This is the primary polling route used by the frontend.
     """
     doc = await db_service.get_document(document_id)
     if not doc:
@@ -789,9 +798,34 @@ async def analysis_status(request: Request, document_id: int, user=Depends(get_c
     if doc["user_id"] != user["id"] and user["role"] != "admin":
         raise HTTPException(403)
 
+    # ── Check Celery task state via task_id stored on the document ───────
+    stored_task_id = doc.get("task_id")
+    if stored_task_id:
+        task = celery_app.AsyncResult(stored_task_id)
+
+        if task.state == "PENDING":
+            return {"success": False, "status": "pending", "progress": 0}
+
+        if task.state == "PROGRESS":
+            return {
+                "success": False,
+                "status": "analyzing",
+                "progress": task.info.get("progress", 0),
+                "stage": task.info.get("stage", ""),
+            }
+
+        if task.state == "FAILURE":
+            return {
+                "success": False,
+                "status": "failed",
+                "error": str(task.info),
+            }
+
+    # ── Task SUCCESS or no task_id stored — read result from DB ─────────
     result = await db_service.get_analysis_result_for_document(document_id)
     if not result:
-        return {"status": "pending"}
+        # Still running (task_id not stored yet) — report pending
+        return {"success": False, "status": "pending", "progress": 0}
 
     # ── Decode matched sources ───────────────────────────────────────────
     raw_sources = result.get("matched_web_sources", []) or []
@@ -800,8 +834,8 @@ async def analysis_status(request: Request, document_id: int, user=Depends(get_c
         decoded = decode_source(s)
         if decoded:
             decoded_sources.append(decoded)
-    
-    # ── Parse sentence source map from JSONB ────────────────────────────
+
+    # ── Parse sentence source map ────────────────────────────────────────
     sentence_source_map = {}
     raw_map = result.get("sentence_source_map")
     if raw_map:
@@ -813,7 +847,7 @@ async def analysis_status(request: Request, document_id: int, user=Depends(get_c
 
     # ── Pull scores ──────────────────────────────────────────────────────
     extracted_text = doc.get("extracted_text", "") or ""
-    ai_pct = float(result["ai_detected_percentage"])
+    ai_pct   = float(result["ai_detected_percentage"])
     plag_pct = float(result["web_source_percentage"])
     orig_pct = float(result["human_written_percentage"])
     interpretation = classify_submission(ai_pct, plag_pct)
@@ -821,25 +855,26 @@ async def analysis_status(request: Request, document_id: int, user=Depends(get_c
     return {
         "success": True,
         "status": "completed",
+        "progress": 100,
         "result": {
-            "document_id": result["document_id"],
-            "ai_detected_percentage": ai_pct,
-            "web_source_percentage": plag_pct,
+            "document_id":              result["document_id"],
+            "ai_detected_percentage":   ai_pct,
+            "web_source_percentage":    plag_pct,
             "human_written_percentage": orig_pct,
             "local_similarity_percentage": float(result.get("local_similarity_percentage", 0)),
             "interpretation": {
-                "case": interpretation["case"],
-                "verdict": interpretation["verdict"],
+                "case":        interpretation["case"],
+                "verdict":     interpretation["verdict"],
                 "description": interpretation["description"],
-                "risk": interpretation["risk"],
-                "action": interpretation["action"],
+                "risk":        interpretation["risk"],
+                "action":      interpretation["action"],
             },
-            "analysis_summary": result["analysis_summary"],
-            "analysis_date": result["analysis_date"].isoformat() if result["analysis_date"] else None,
-            "matched_sources": decoded_sources,
+            "analysis_summary":        result["analysis_summary"],
+            "analysis_date":           result["analysis_date"].isoformat() if result["analysis_date"] else None,
+            "matched_sources":         decoded_sources,
             "processing_time_seconds": result.get("processing_time_seconds", 0),
-            "extracted_text": extracted_text,
-            "sentence_source_map": sentence_source_map,  # ✅ NEW
+            "extracted_text":          extracted_text,
+            "sentence_source_map":     sentence_source_map,
         },
     }
 

@@ -1,14 +1,3 @@
-
-
-
-
-
-
-
-
-
-
-
 # backend/app/libs/ai_detection.py
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
@@ -177,14 +166,22 @@ CALIBRATION_CURVE_ACADEMIC = [
 
 CALIBRATION_CURVE_GENERAL = [
     # (raw_score, calibrated_score) — for non-academic documents (essays, blogs, etc.)
+    #
+    # CALIBRATION FIX:
+    # Old curve mapped raw=60 → 40, which was far too conservative.
+    # grok.txt (clearly 100% AI essay) had RoBERTa=98% but total calibrated=40%
+    # because the other weak methods dragged the ensemble raw down to 60%.
+    # The curve must respect that a raw=60 with RoBERTa at 98% is still strong AI.
+    # New curve: much more linear — raw score is already a good signal for general text.
     (0.0,   0.0),
-    (20.0,  0.0),
-    (30.0,  5.0),
-    (45.0,  15.0),
-    (60.0,  40.0),
-    (75.0,  65.0),
-    (85.0,  80.0),
-    (95.0,  95.0),
+    (15.0,  0.0),
+    (25.0,  5.0),
+    (40.0,  20.0),
+    (55.0,  45.0),
+    (65.0,  60.0),
+    (75.0,  72.0),
+    (85.0,  83.0),
+    (92.0,  92.0),
     (100.0, 95.0),
 ]
 
@@ -769,13 +766,60 @@ _GENERIC_LLM_PATTERNS = {
     ]),
 }
 
+# ── AI Essay/Report Format Patterns ──────────────────────────────────────
+# AI models generating essays ALWAYS add these structural disclosure markers.
+# Human writers NEVER add "(Word count: approximately X)" or
+# "structured as a comprehensive essay covering key aspects" to their own work.
+# These are the most reliable AI signals for essay-format output.
+_AI_ESSAY_PATTERNS = {
+    "word_count_disclosure": (1.5, [
+        # AI models frequently append word count — humans never do this
+        r"\(word count[:\s]*approximately \d+",
+        r"\(word count[:\s]*~?\d+",
+        r"\bword count[:\s]*(approximately |~)?\d+\b",
+        r"\b(approximately|about|roughly) \d+ words?\b",
+    ]),
+    "structural_meta": (1.4, [
+        # AI self-labeling its own output structure — dead giveaway
+        r"\bstructured as (a )?comprehensive\b",
+        r"\bcomprehensive (essay|overview|guide|report) covering\b",
+        r"\bcovering (key|all|the main|major) aspects?\b",
+        r"\bin-depth (exploration|analysis|overview|examination)\b",
+        r"\bkey aspects?[:\s]",
+    ]),
+    "ai_essay_openers": (1.2, [
+        r"\bin (conclusion|summary)[,:\s]*(plagiarism|this|we|it|the)\b",
+        r"\bto (summarize|recap|conclude)[,:\s]",
+        r"\bin this (essay|article|overview|guide|report)[,\s]",
+        r"\bthis (essay|article|overview|guide|report) (explores?|examines?|covers?|discusses?|provides?)\b",
+        r"\bby understanding\b",
+    ]),
+    "ai_list_framing": (1.0, [
+        # AI loves listing and enumerating — with these specific framings
+        r"\bcommon types (include|are)[:\s]",
+        r"\bmanifests? in (various|several|many|different) forms?\b",
+        r"\branging from .{5,50} to\b",
+        r"\bthese (figures|statistics|numbers) (underscore|highlight|demonstrate|show|indicate)\b",
+        r"\bacross (domains|sectors|industries|fields|areas)[:\s]",
+    ]),
+    "ai_closing_phrases": (1.1, [
+        r"\bupholding (integrity|ethics|values)\b",
+        r"\bensures? (progress|success|trust|integrity) built on\b",
+        r"\bbenefiting society (at large|as a whole)\b",
+        r"\brenewed commitment to\b",
+        r"\bas we navigate\b",
+        r"\bin (the digital|an? ai|the modern) era\b",
+    ]),
+}
+
 _ALL_MODEL_PATTERNS = [
-    ("chatgpt", _CHATGPT_PATTERNS,  1.0),
-    ("claude",  _CLAUDE_PATTERNS,   1.0),
-    ("gemini",  _GEMINI_PATTERNS,   1.0),
-    ("grok",    _GROK_PATTERNS,     1.0),
-    ("lovable", _LOVABLE_PATTERNS,  1.0),
-    ("generic", _GENERIC_LLM_PATTERNS, 1.2),
+    ("chatgpt",   _CHATGPT_PATTERNS,       1.0),
+    ("claude",    _CLAUDE_PATTERNS,        1.0),
+    ("gemini",    _GEMINI_PATTERNS,        1.0),
+    ("grok",      _GROK_PATTERNS,          1.0),
+    ("lovable",   _LOVABLE_PATTERNS,       1.0),
+    ("generic",   _GENERIC_LLM_PATTERNS,   1.2),
+    ("ai_essay",  _AI_ESSAY_PATTERNS,      1.5),  # Essay-format AI — highest weight
 ]
 
 
@@ -821,8 +865,9 @@ def _m6_ai_patterns(text: str) -> float:
             return 0.0
 
         total_raw = sum(model_scores.values())
-        # CALIBRATED: 6 weighted pattern matches → ~100% (was 8)
-        score = _clamp(total_raw / 6.0 * 100.0)
+        # CALIBRATED: 5 weighted pattern matches → ~100%
+        # Denominator raised from 6 to 5 to keep sensitivity with more pattern groups
+        score = _clamp(total_raw / 5.0 * 100.0)
 
         dominant = max(model_scores, key=model_scores.get)
         logger.debug("M6 AI Patterns: %.1f%% | dominant=%s | %s",
@@ -896,6 +941,22 @@ def _run_ensemble(text: str) -> Dict:
     # RoBERTa + AI Patterns: different methods (ML vs regex) agreeing is strong signal
     if adjusted_scores["ai_patterns"] > 50 and adjusted_scores["roberta"] > 60:
         ensemble = min(ensemble + 3.0, MAX_AI_SCORE)
+
+    # ── STRONG ROBERTA DOMINANCE BOOST ──────────────────────────────────────
+    # RoBERTa is trained specifically for AI detection (55% weight).
+    # When it fires at >=85%, it is nearly certain the text is AI-generated.
+    # The other weak methods (burstiness, stylometrics, token_dist) often score
+    # near-zero on essay text even when it IS AI, diluting the ensemble unfairly.
+    # This boost ensures RoBERTa's strong signal is not buried by silent methods.
+    if adjusted_scores["roberta"] >= 85:
+        # Pull ensemble up toward RoBERTa's signal, proportionally
+        roberta_signal = adjusted_scores["roberta"] * ENSEMBLE_WEIGHTS["roberta"]
+        shortfall = roberta_signal - ensemble * ENSEMBLE_WEIGHTS["roberta"]
+        ensemble = min(ensemble + max(shortfall * 0.5, 5.0), MAX_AI_SCORE)
+
+    if adjusted_scores["roberta"] >= 95:
+        # Near-certain AI from RoBERTa — ensure final score reflects this
+        ensemble = max(ensemble, 75.0)
 
     # Choose calibration curve based on document type
     curve = CALIBRATION_CURVE_ACADEMIC if is_academic else CALIBRATION_CURVE_GENERAL
