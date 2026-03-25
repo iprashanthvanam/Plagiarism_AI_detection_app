@@ -1,47 +1,57 @@
+
+
+
 """
-Background analysis tasks — run asynchronously in Celery workers.
+tasks.py — Celery background tasks for TKREC Plagiarism Analysis
 
-BUG FIXED IN THIS VERSION
-──────────────────────────────────────────────────────────────────────
-TypeError: '>' not supported between instances of 'coroutine' and 'float'
+ARCHITECTURE v4 — PARALLEL PIPELINE
+══════════════════════════════════════════════════════════════════════
 
-ROOT CAUSE:
-  local_plagiarism_score() is declared as `async def` in plagiarism.py.
+NEW: process_document_task  ← called by /upload-batch for each file
+     ┌─────────────────────────────────────────────────────────────┐
+     │  Stage 1  Extract text from file (sequential, mandatory)    │
+     │  Stage 2  Store extracted text to DB                        │
+     │  Stage 3  PARALLEL via asyncio.gather:                      │
+     │           ├─ local_plagiarism_score()  ← async, DB fetch    │
+     │           ├─ google_search_with_matches()  ← sync→thread    │
+     │           └─ detect_ai_content_detailed()  ← sync→thread    │
+     │  Stage 4  Fetch web source texts (for sentence mapping)     │
+     │  Stage 5  Compute sentence→source map                       │
+     │  Stage 6  Compute final scores                              │
+     │  Stage 7  Save AnalysisResult to DB                         │
+     └─────────────────────────────────────────────────────────────┘
 
-  The code was calling it like this:
-      local_score = await asyncio.to_thread(local_plagiarism_score, text, other_texts)
+KEPT:  run_analysis  ← legacy task, used by existing /analyze/{id} route
+       Still works for single-file upload via old flow.
 
-  asyncio.to_thread(fn, *args) runs fn(*args) in a thread pool executor.
-  When fn is an `async def`, calling fn(*args) in the thread returns a
-  COROUTINE OBJECT — it does not execute the function, it does not await it.
-  The coroutine is never run. local_score = <coroutine object at 0x...>.
+KEY CHANGE in _run_analysis_async:
+  OLD — sequential:
+    local_score  = await local_plagiarism_score(...)        # ~5s
+    web_result   = await to_thread(google_search...)        # ~40s
+    ai_result    = detect_ai_content_detailed(...)          # ~6s
+    Total: ~51s sequential
 
-  Later, compute_scores() tries: max(0.0, local_score)
-  Python cannot compare a coroutine with a float → TypeError crash.
+  NEW — parallel:
+    local_score, web_result, ai_result = await asyncio.gather(
+        _local_plag_with_fetch(text, document_id),          # ~5s ─┐
+        asyncio.to_thread(google_search_with_matches, ...),  # ~40s ├─ run at same time
+        asyncio.to_thread(detect_ai_content_detailed, ...),  # ~6s ─┘
+    )
+    Total: ~40s (bottleneck = Google search, others overlap for free)
 
-  The logger line before that also crashed:
-      logger.info("...%.1f%%...", local_score, ...)
-  → TypeError: must be real number, not coroutine
-
-FIX:
-  Since local_plagiarism_score IS async def, call it with await directly:
-      local_score = await local_plagiarism_score(text, other_texts)
-
-  asyncio.to_thread() is only for SYNC (non-async) functions.
-  For async def functions: use await directly.
-
-ALSO FIXED:
-  asyncio.run() replaced with persistent event loop (loop.run_until_complete).
-  asyncio.run() creates + destroys the event loop each task call, which
-  corrupts asyncpg's internal pool state. A persistent loop prevents this.
-──────────────────────────────────────────────────────────────────────
+PERSISTENT EVENT LOOP:
+  Each Celery worker process gets one long-lived event loop.
+  asyncio.run() is NOT used — it destroys the loop each call, which
+  corrupts asyncpg's pool state. loop.run_until_complete() on the
+  same persistent loop lets asyncpg safely reuse its connection pool.
+══════════════════════════════════════════════════════════════════════
 """
 
 import asyncio
 import logging
 import threading
 from datetime import datetime
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Tuple
 
 from app.core.celery_client import celery_app
 from app.libs.database import db_service
@@ -50,10 +60,10 @@ from app.libs.ai_detection import detect_ai_content_detailed
 from app.libs.plagiarism import (
     local_plagiarism_score,
     local_plagiarism_score_with_commoncrawl,
-    compute_sentence_source_map,  # ✅ ADD THIS IMPORT
+    compute_sentence_source_map,
 )
 from app.libs.models import AnalysisResult
-from app.libs.extract import extract_text  # ✅ CORRECT MODULE NAME
+from app.libs.extract import extract_text
 
 # ── Logger ─────────────────────────────────────────────────────────────────────
 logger = logging.getLogger("tasks")
@@ -63,14 +73,12 @@ MIN_TEXT_LENGTH        = 20
 SEARCH_TEXT_WORD_LIMIT = 300
 
 
-# ── PERSISTENT EVENT LOOP — one per Celery worker process ─────────────────────
-# Replaces asyncio.run() which creates + destroys a loop per task call.
-# asyncpg pools are bound to the loop they were created on. If asyncio.run()
-# destroys the loop, the pool becomes invalid and the next task hangs.
-# A persistent loop lets asyncpg reuse the same healthy pool for all tasks.
+# ══════════════════════════════════════════════════════════════════════════════
+# PERSISTENT EVENT LOOP — one per Celery worker process
+# ══════════════════════════════════════════════════════════════════════════════
 
 _worker_loop: Optional[asyncio.AbstractEventLoop] = None
-_loop_lock = threading.Lock()
+_loop_lock   = threading.Lock()
 
 
 def _get_worker_loop() -> asyncio.AbstractEventLoop:
@@ -125,7 +133,7 @@ def compute_scores(
     commoncrawl_score:  float,
     local_score:        float,
     ai_score:           float,
-):
+) -> Tuple[float, float, float, float]:
     plagiarism  = max(verbatim_web_score, commoncrawl_score * 0.5)
     plagiarism  = round(min(100.0, max(0.0, plagiarism)), 2)
     originality = round(max(0.0, 100.0 - plagiarism), 2)
@@ -224,222 +232,307 @@ def classify_submission(ai_pct: float, plagiarism_pct: float) -> dict:
     }
 
 
-# ── Core async pipeline ────────────────────────────────────────────────────────
+def _fetch_url_text(url: str, timeout: int = 5) -> Optional[str]:
+    """Sync helper: fetch plain text from a URL (used via asyncio.to_thread)."""
+    try:
+        import requests
+        from bs4 import BeautifulSoup
 
-async def _run_analysis_async(document_id: int, user_id: str, task_self) -> dict:
+        headers = {"User-Agent": "Mozilla/5.0 (Academic Research Bot)"}
+        response = requests.get(url, headers=headers, timeout=timeout)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.content, "html.parser")
+        for script in soup(["script", "style"]):
+            script.decompose()
+        text = soup.get_text()
+        lines  = (line.strip() for line in text.splitlines())
+        chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
+        return " ".join(chunk for chunk in chunks if chunk) or None
+    except Exception as e:
+        logger.debug("Failed to fetch %s: %s", url, e)
+        return None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PARALLEL ANALYSIS HELPER — fetches other-doc texts AND runs local plagiarism
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def _local_plag_with_fetch(
+    text: str,
+    document_id: int,
+) -> Tuple[float, List[str]]:
     """
-    Full analysis pipeline. Runs on the persistent worker event loop.
+    Fetch all other documents' texts from DB then run local_plagiarism_score.
+    Returns (local_score, other_texts).
+    Wrapped in a single coroutine so asyncio.gather can run it in parallel
+    with Google search and AI detection.
     """
-    import time as _time
-    from datetime import datetime as dt
-
-    logger.info("[doc=%d] analysis_task_started", document_id)
-    task_self.update_state(state="PROGRESS", meta={"progress": 10, "stage": "Loading document"})
-
-    # ── Load document ──────────────────────────────────────────────────────────
-    doc = await db_service.get_document(document_id)
-    if not doc:
-        raise ValueError(f"Document {document_id} not found in database")
-
-    if doc["user_id"] != user_id:
-        raise PermissionError(f"User {user_id} not authorized for document {document_id}")
-
-    file_name = doc.get("file_name", "")
-    file_path = doc.get("file_path", "")
-    content_type = doc.get("content_type", "")
-
-    start = dt.utcnow()
-
-    # ── STAGE 1: Extract text from file ────────────────────────────────────────
-    logger.info("[doc=%d] Extracting text from %s", document_id, file_name)
-    extracted_text = await extract_text(file_path, content_type)
-    
-    if not extracted_text or len(extracted_text.strip()) < 50:
-        raise ValueError(
-            f"Text extraction failed or returned empty/tiny text. "
-            f"Extracted {len(extracted_text) if extracted_text else 0} chars."
-        )
-    
-    # ✅ Store extracted text
-    logger.info("[doc=%d] Storing extracted text (%d chars) to database",
-                document_id, len(extracted_text))
-    
-    success, stored_length = await db_service.store_extracted_text(
-        document_id, extracted_text
-    )
-    
-    if not success:
-        logger.error(
-            "[doc=%d] ❌ TEXT STORAGE VALIDATION FAILED. "
-            "Sent %d chars, only %d stored.",
-            document_id, len(extracted_text), stored_length
-        )
-    else:
-        logger.info(
-            "[doc=%d] ✅ Text storage validated: %d chars stored ✓",
-            document_id, stored_length
-        )
-    
-    text = extracted_text.strip()
-
-    # ── STAGE 2: Internal DB Similarity (20%) ─────────────────────────────────
-    task_self.update_state(state="PROGRESS", meta={"progress": 20, "stage": "Checking internal database"})
-    t1 = _time.perf_counter()
-
     others = await db_service.get_all_documents_texts(exclude_id=document_id)
     other_texts: List[str] = [
         (d.get("extracted_text") or d.get("text") or "")
         for d in others
         if (d.get("extracted_text") or d.get("text") or "").strip()
     ]
-
-    local_score = 0.0
     try:
-        local_score = await local_plagiarism_score(text, other_texts)
-        logger.info(
-            "[doc=%d] internal_db=%.1f%% docs=%d ms=%.0f",
-            document_id, local_score, len(other_texts),
-            (_time.perf_counter() - t1) * 1000,
-        )
+        score = await local_plagiarism_score(text, other_texts)
+        return float(score), other_texts
     except Exception as e:
-        logger.exception("[doc=%d] internal_db_failed: %s", document_id, e)
-        local_score = 0.0
+        logger.exception("[doc=%d] local_plagiarism failed: %s", document_id, e)
+        return 0.0, []
 
-    # ── STAGE 3: Web Search + Verbatim Matching (40%) ───────────────────────────
-    task_self.update_state(state="PROGRESS", meta={"progress": 40, "stage": "Searching web sources"})
-    t2 = _time.perf_counter()
 
-    verbatim_web_score = 0.0
-    web_search_result = {"urls": [], "matches": {}, "top_match_pct": 0.0, "queries_used": []}
+# ══════════════════════════════════════════════════════════════════════════════
+# NEW TASK — process_document_task
+# Called by /upload-batch for each uploaded file.
+# Does EVERYTHING: extract → store → parallel analysis → save results.
+# ══════════════════════════════════════════════════════════════════════════════
+
+@celery_app.task(bind=True, name="process_document")
+def process_document_task(self, document_id: int, user_id: str):
+    """
+    All-in-one Celery task enqueued by /upload-batch.
+
+    Stages:
+      1. Extract text from the raw file on disk
+      2. Store extracted text to DB
+      3. PARALLEL: local plagiarism + web search + AI detection
+      4. Sentence-to-source mapping
+      5. Compute scores
+      6. Persist AnalysisResult
+
+    Multiple instances run simultaneously (one per uploaded file), each in
+    its own Celery worker slot, giving true parallel per-file processing.
+    """
+    logger.info(
+        "process_document | task_id=%s doc_id=%d user=%s",
+        self.request.id, document_id, user_id,
+    )
+    analysis_started()
+
+    try:
+        loop   = _get_worker_loop()
+        result = loop.run_until_complete(
+            _process_document_async(document_id, user_id, self)
+        )
+        analysis_completed(result.get("processing_time", 0.0))
+        logger.info(
+            "process_document SUCCESS | task_id=%s doc_id=%d scores=%s",
+            self.request.id, document_id, result.get("scores", {}),
+        )
+        return result
+
+    except Exception as e:
+        analysis_failed()
+        logger.exception(
+            "process_document FAILED | task_id=%s doc_id=%d error=%s",
+            self.request.id, document_id, str(e),
+        )
+        self.update_state(
+            state="FAILURE",
+            meta={"progress": 0, "stage": "Failed", "error": str(e)},
+        )
+        raise
+
+
+async def _process_document_async(
+    document_id: int,
+    user_id: str,
+    task_self,
+) -> dict:
+    """
+    Full async pipeline for process_document_task.
+
+    Stage 1 — Extract text  (blocking I/O → OCR/PDF parsing)
+    Stage 2 — Store text to DB
+    Stage 3 — THREE-WAY PARALLEL:
+                 a) local_plagiarism_score  (asyncpg query + ensemble)
+                 b) google_search_with_matches  (HTTP → to_thread)
+                 c) detect_ai_content_detailed  (CPU  → to_thread)
+    Stage 4 — Fetch web source texts for sentence mapping
+    Stage 5 — Compute sentence→source map
+    Stage 6 — Compute final scores + classification
+    Stage 7 — Persist AnalysisResult
+    """
+    import time as _time
+    from datetime import datetime as dt
+
+    start = dt.utcnow()
+
+    # ── Load document metadata ─────────────────────────────────────────────────
+    task_self.update_state(
+        state="PROGRESS",
+        meta={"progress": 5, "stage": "Loading document"},
+    )
+    doc = await db_service.get_document(document_id)
+    if not doc:
+        raise ValueError(f"Document {document_id} not found")
+    if doc["user_id"] != user_id:
+        raise PermissionError(f"User {user_id} not authorised for doc {document_id}")
+
+    file_name    = doc.get("file_name", "")
+    file_path    = doc.get("file_path", "")
+    content_type = doc.get("content_type", "")
+
+    # ── STAGE 1: Extract text ──────────────────────────────────────────────────
+    task_self.update_state(
+        state="PROGRESS",
+        meta={"progress": 10, "stage": "Extracting text"},
+    )
+    logger.info("[doc=%d] extracting text from %s", document_id, file_name)
+
+    extracted_text = await extract_text(file_path, content_type)
+
+    if not extracted_text or len(extracted_text.strip()) < MIN_TEXT_LENGTH:
+        raise ValueError(
+            f"Text extraction failed or returned too-short text "
+            f"({len(extracted_text) if extracted_text else 0} chars). "
+            f"Check file integrity and GEMINI_API_KEY."
+        )
+
+    # ── STAGE 2: Store extracted text ─────────────────────────────────────────
+    task_self.update_state(
+        state="PROGRESS",
+        meta={"progress": 18, "stage": "Storing extracted text"},
+    )
+    success, stored_len = await db_service.store_extracted_text(
+        document_id, extracted_text
+    )
+    if not success:
+        logger.error(
+            "[doc=%d] TEXT STORAGE VALIDATION FAILED sent=%d stored=%d",
+            document_id, len(extracted_text), stored_len,
+        )
+    else:
+        logger.info(
+            "[doc=%d] text stored: %d chars", document_id, stored_len,
+        )
+
+    text        = extracted_text.strip()
     search_text = " ".join(text.split()[:SEARCH_TEXT_WORD_LIMIT])
 
-    try:
-        web_search_result = await asyncio.to_thread(google_search_with_matches, search_text)
-        verbatim_web_score = web_search_result.get("top_match_pct", 0.0)
-        logger.info(
-            "[doc=%d] web_search urls=%d top_match=%.1f%% ms=%.0f",
-            document_id,
-            len(web_search_result.get("urls", [])),
-            verbatim_web_score,
-            (_time.perf_counter() - t2) * 1000,
-        )
-    except Exception as e:
-        logger.exception("[doc=%d] web_search_failed: %s", document_id, e)
-        verbatim_web_score = 0.0
+    # ── STAGE 3: THREE-WAY PARALLEL ANALYSIS ──────────────────────────────────
+    #
+    #  a) _local_plag_with_fetch  — DB query + TF-IDF ensemble   (async)
+    #  b) google_search_with_matches — HTTP + scrape              (sync→thread)
+    #  c) detect_ai_content_detailed — 6-method CPU ensemble      (sync→thread)
+    #
+    # All three have NO dependency on each other → run simultaneously.
+    # Wall-clock time = max(a, b, c) instead of a + b + c.
+    # ──────────────────────────────────────────────────────────────────────────
+    task_self.update_state(
+        state="PROGRESS",
+        meta={
+            "progress": 25,
+            "stage": "Running parallel analysis (plagiarism + web search + AI detection)",
+        },
+    )
+    t_parallel = _time.perf_counter()
 
-    # ── STAGE 3b: Extract source texts for sentence mapping ──────────────────
-    task_self.update_state(state="PROGRESS", meta={"progress": 35, "stage": "Extracting source content"})
-    
+    (local_score, other_texts), web_search_result, ai_raw = await asyncio.gather(
+        _local_plag_with_fetch(text, document_id),                     # a
+        asyncio.to_thread(google_search_with_matches, search_text),    # b
+        asyncio.to_thread(detect_ai_content_detailed, text),           # c
+    )
+
+    logger.info(
+        "[doc=%d] parallel analysis complete in %.1fs | "
+        "local=%.1f%% web_top=%.1f%% ai=%.1f%%",
+        document_id,
+        _time.perf_counter() - t_parallel,
+        local_score,
+        web_search_result.get("top_match_pct", 0.0),
+        ai_raw.get("score", 0.0),
+    )
+
+    verbatim_web_score = web_search_result.get("top_match_pct", 0.0)
+    ai_score           = ai_raw.get("score", 0.0)
+    ai_breakdown       = ai_raw.get("breakdown", {})
+
+    # ── STAGE 4: Fetch web source texts (for sentence mapping) ────────────────
+    task_self.update_state(
+        state="PROGRESS",
+        meta={"progress": 68, "stage": "Fetching web source content"},
+    )
     web_source_texts: List[str] = []
-    web_source_urls: List[str] = []
-    
-    try:
-        for url in web_search_result.get("urls", [])[:5]:
-            try:
-                source_text = await asyncio.to_thread(_fetch_url_text, url)
-                if source_text and len(source_text.strip()) > 100:
-                    web_source_texts.append(source_text)
-                    web_source_urls.append(url)
-            except Exception as e:
-                logger.debug("Could not fetch text from %s: %s", url, e)
-                continue
-        
-        logger.info(
-            "[doc=%d] Extracted text from %d web sources",
-            document_id, len(web_source_texts)
-        )
-    except Exception as e:
-        logger.warning("[doc=%d] Web source extraction failed: %s", document_id, e)
+    web_source_urls:  List[str] = []
 
-    # ── STAGE 3c: Sentence to Source Mapping ────────────────────────────────
-    task_self.update_state(state="PROGRESS", meta={"progress": 38, "stage": "Mapping sentences to sources"})
-    
+    for url in web_search_result.get("urls", [])[:5]:
+        try:
+            src_text = await asyncio.to_thread(_fetch_url_text, url)
+            if src_text and len(src_text.strip()) > 100:
+                web_source_texts.append(src_text)
+                web_source_urls.append(url)
+        except Exception as e:
+            logger.debug("[doc=%d] Could not fetch %s: %s", document_id, url, e)
+
+    logger.info(
+        "[doc=%d] fetched %d web source texts",
+        document_id, len(web_source_texts),
+    )
+
+    # ── STAGE 5: Sentence → Source mapping ────────────────────────────────────
+    task_self.update_state(
+        state="PROGRESS",
+        meta={"progress": 75, "stage": "Mapping sentences to sources"},
+    )
     sentence_source_map: Dict[str, int] = {}
     try:
         if web_source_texts:
             sentence_source_map = await compute_sentence_source_map(
-                text,
-                web_source_texts,
-                web_source_urls
+                text, web_source_texts, web_source_urls
             )
             logger.info(
-                "[doc=%d] ✅ Sentence map computed: %d sentences matched",
-                document_id, len(sentence_source_map)
+                "[doc=%d] sentence map: %d sentences matched",
+                document_id, len(sentence_source_map),
             )
-        else:
-            logger.warning("[doc=%d] No web source texts to map sentences against", document_id)
     except Exception as e:
-        logger.exception("[doc=%d] Sentence mapping failed: %s", document_id, e)
-        sentence_source_map = {}
+        logger.exception("[doc=%d] sentence mapping failed: %s", document_id, e)
 
-    # ── STAGE 4: AI Detection (50%) ────────────────────────────────────────────
-    task_self.update_state(state="PROGRESS", meta={"progress": 50, "stage": "Detecting AI content"})
-    t3 = _time.perf_counter()
-
-    ai_score = 0.0
-    ai_breakdown = {}
-    try:
-        result = detect_ai_content_detailed(text)  # ✅ NO AWAIT — it's sync   #result = await asyncio.to_thread(detect_ai_content_detailed, text)
-        ai_score = result.get("score", 0.0)
-        ai_breakdown = result.get("breakdown", {})
-        logger.info(
-            "[doc=%d] ai_detection=%.1f%% ms=%.0f",
-            document_id, ai_score,
-            (_time.perf_counter() - t3) * 1000,
-        )
-    except Exception as e:
-        logger.exception("[doc=%d] ai_detection_failed: %s", document_id, e)
-        ai_score = 0.0
-        ai_breakdown = {}
-
-    # ── STAGE 5: Compute final scores ──────────────────────────────────────────
-    task_self.update_state(state="PROGRESS", meta={"progress": 80, "stage": "Computing final scores"})
-
-    commoncrawl_score = 0.0  # CommonCrawl integration is future work
+    # ── STAGE 6: Compute CommonCrawl score (optional, non-blocking) ───────────
+    task_self.update_state(
+        state="PROGRESS",
+        meta={"progress": 80, "stage": "Computing final scores"},
+    )
+    commoncrawl_score = 0.0
     try:
         commoncrawl_score = await asyncio.to_thread(
             local_plagiarism_score_with_commoncrawl, text
         )
     except Exception as e:
-        logger.warning("[doc=%d] commoncrawl_failed: %s", document_id, e)
-        commoncrawl_score = 0.0
+        logger.warning("[doc=%d] commoncrawl failed (non-fatal): %s", document_id, e)
 
-    plagiarism_score, originality_score, ai_score, internal_score = compute_scores(
+    plagiarism_score, originality_score, final_ai, internal_score = compute_scores(
         verbatim_web_score=verbatim_web_score,
         commoncrawl_score=commoncrawl_score,
         local_score=local_score,
         ai_score=ai_score,
     )
+    interpretation = classify_submission(final_ai, plagiarism_score)
 
-    interpretation = classify_submission(ai_score, plagiarism_score)
-
-    # ── STAGE 6: Build sources list ────────────────────────────────────────────
+    # ── Build sources list ─────────────────────────────────────────────────────
     sources = []
     for url in web_search_result.get("urls", []):
         match_data = web_search_result.get("matches", {}).get(url, {})
-        match_pct = match_data.get("match_pct", 0.0)
-        
-        # Only encode sources with match% >= 0.1
+        match_pct  = match_data.get("match_pct", 0.0)
         if match_pct >= 0.1:
             encoded = encode_web_source(url, match_pct)
             if encoded:
                 sources.append(encoded)
-
-    # Add local DB sources if significant match
     if local_score > 0.1:
         sources.append("local_db::internal_database")
 
-    # ── Compute processing time ────────────────────────────────────────────────
-    end = dt.utcnow()
+    # ── STAGE 7: Persist AnalysisResult ───────────────────────────────────────
+    task_self.update_state(
+        state="PROGRESS",
+        meta={"progress": 90, "stage": "Saving results"},
+    )
+    end             = dt.utcnow()
     processing_time = (end - start).total_seconds()
-
-    # ── STAGE 7: Store analysis result ─────────────────────────────────────────
-    task_self.update_state(state="PROGRESS", meta={"progress": 90, "stage": "Storing results"})
 
     result_obj = AnalysisResult(
         document_id=document_id,
         analyzed_by=user_id,
-        ai_detected_percentage=ai_score,
+        ai_detected_percentage=final_ai,
         web_source_percentage=plagiarism_score,
         local_similarity_percentage=internal_score,
         human_written_percentage=originality_score,
@@ -449,16 +542,15 @@ async def _run_analysis_async(document_id: int, user_id: str, task_self) -> dict
         sentence_source_map=sentence_source_map,
         processing_time_seconds=processing_time,
     )
-
     await db_service.create_analysis_result(result_obj)
 
     logger.info(
-        "[doc=%d] analysis_complete | %s | risk=%s | "
+        "[doc=%d] COMPLETE | %s | risk=%s | "
         "ai=%.1f%% plag=%.1f%% orig=%.1f%% internal=%.1f%% | "
-        "sources=%d duration=%.2fs text_extracted=%d chars",
+        "sources=%d duration=%.2fs text=%d chars",
         document_id,
         interpretation["case"], interpretation["risk"],
-        ai_score, plagiarism_score, originality_score, internal_score,
+        final_ai, plagiarism_score, originality_score, internal_score,
         len(sources), processing_time, len(extracted_text),
     )
 
@@ -466,31 +558,32 @@ async def _run_analysis_async(document_id: int, user_id: str, task_self) -> dict
         "document_id": document_id,
         "status": "completed",
         "scores": {
-            "ai": ai_score,
-            "plagiarism": plagiarism_score,
+            "ai":          final_ai,
+            "plagiarism":  plagiarism_score,
             "originality": originality_score,
-            "internal": internal_score,
+            "internal":    internal_score,
         },
         "processing_time": processing_time,
     }
 
 
-# ── Celery task ────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# LEGACY TASK — run_analysis
+# Used by the existing /analyze/{document_id} route (single-file upload flow).
+# Expects extracted_text to already be in the DB (set by /upload).
+# Kept for backward compatibility — new code should use process_document_task.
+# ══════════════════════════════════════════════════════════════════════════════
 
 @celery_app.task(bind=True, name="run_analysis")
 def run_analysis(self, document_id: int, user_id: str):
     """
-    Celery task wrapper. Uses a persistent event loop instead of asyncio.run().
-
-    asyncio.run() creates and destroys an event loop per task call.
-    asyncpg pools are bound to the loop they were created on — destroying
-    the loop corrupts the pool. Subsequent tasks hang waiting on invalid fds.
-
-    loop.run_until_complete() on a persistent loop prevents this entirely.
+    Legacy task wrapper. Kept for backward compat with /analyze/{document_id}.
+    Uses persistent event loop (same pattern as process_document_task).
     """
-    logger.info("Task received | task_id=%s doc_id=%d user=%s",
-                self.request.id, document_id, user_id)
-
+    logger.info(
+        "run_analysis | task_id=%s doc_id=%d user=%s",
+        self.request.id, document_id, user_id,
+    )
     analysis_started()
 
     try:
@@ -498,16 +591,19 @@ def run_analysis(self, document_id: int, user_id: str):
         result = loop.run_until_complete(
             _run_analysis_async(document_id, user_id, self)
         )
-
         analysis_completed(result.get("processing_time", 0.0))
-        logger.info("Task SUCCESS | task_id=%s doc_id=%d scores=%s",
-                    self.request.id, document_id, result.get("scores", {}))
+        logger.info(
+            "run_analysis SUCCESS | task_id=%s doc_id=%d scores=%s",
+            self.request.id, document_id, result.get("scores", {}),
+        )
         return result
 
     except Exception as e:
         analysis_failed()
-        logger.exception("Task FAILED | task_id=%s doc_id=%d error=%s",
-                         self.request.id, document_id, str(e))
+        logger.exception(
+            "run_analysis FAILED | task_id=%s doc_id=%d error=%s",
+            self.request.id, document_id, str(e),
+        )
         self.update_state(
             state="FAILURE",
             meta={"progress": 0, "stage": "Failed", "error": str(e)},
@@ -515,45 +611,191 @@ def run_analysis(self, document_id: int, user_id: str):
         raise
 
 
-def _fetch_url_text(url: str, timeout: int = 5) -> Optional[str]:
+async def _run_analysis_async(
+    document_id: int,
+    user_id: str,
+    task_self,
+) -> dict:
     """
-    Fetch and extract plain text from a URL.
-    
-    Args:
-        url: Web URL to fetch
-        timeout: Request timeout in seconds
-    
-    Returns:
-        Extracted text or None if fetch failed
+    Legacy pipeline — assumes extracted_text is already stored in DB.
+    Restructured to use asyncio.gather for parallel analysis (same as new task).
     """
+    import time as _time
+    from datetime import datetime as dt
+
+    logger.info("[doc=%d] run_analysis_async started", document_id)
+    task_self.update_state(
+        state="PROGRESS",
+        meta={"progress": 10, "stage": "Loading document"},
+    )
+
+    # ── Load document ──────────────────────────────────────────────────────────
+    doc = await db_service.get_document(document_id)
+    if not doc:
+        raise ValueError(f"Document {document_id} not found in database")
+    if doc["user_id"] != user_id:
+        raise PermissionError(f"User {user_id} not authorized for document {document_id}")
+
+    file_name    = doc.get("file_name", "")
+    file_path    = doc.get("file_path", "")
+    content_type = doc.get("content_type", "")
+    start        = dt.utcnow()
+
+    # ── STAGE 1: Extract & store text ─────────────────────────────────────────
+    task_self.update_state(
+        state="PROGRESS",
+        meta={"progress": 15, "stage": "Extracting text"},
+    )
+    extracted_text = await extract_text(file_path, content_type)
+
+    if not extracted_text or len(extracted_text.strip()) < 50:
+        raise ValueError(
+            f"Text extraction failed or returned empty/tiny text. "
+            f"Extracted {len(extracted_text) if extracted_text else 0} chars."
+        )
+
+    success, stored_len = await db_service.store_extracted_text(
+        document_id, extracted_text
+    )
+    if not success:
+        logger.error(
+            "[doc=%d] TEXT STORAGE VALIDATION FAILED. sent=%d stored=%d",
+            document_id, len(extracted_text), stored_len,
+        )
+    else:
+        logger.info("[doc=%d] text stored: %d chars", document_id, stored_len)
+
+    text        = extracted_text.strip()
+    search_text = " ".join(text.split()[:SEARCH_TEXT_WORD_LIMIT])
+
+    # ── STAGE 2: THREE-WAY PARALLEL ANALYSIS ──────────────────────────────────
+    task_self.update_state(
+        state="PROGRESS",
+        meta={
+            "progress": 30,
+            "stage": "Running parallel analysis (plagiarism + web search + AI detection)",
+        },
+    )
+    t_parallel = _time.perf_counter()
+
+    (local_score, other_texts), web_search_result, ai_raw = await asyncio.gather(
+        _local_plag_with_fetch(text, document_id),
+        asyncio.to_thread(google_search_with_matches, search_text),
+        asyncio.to_thread(detect_ai_content_detailed, text),
+    )
+
+    logger.info(
+        "[doc=%d] parallel analysis complete in %.1fs | "
+        "local=%.1f%% web_top=%.1f%% ai=%.1f%%",
+        document_id,
+        _time.perf_counter() - t_parallel,
+        local_score,
+        web_search_result.get("top_match_pct", 0.0),
+        ai_raw.get("score", 0.0),
+    )
+
+    verbatim_web_score = web_search_result.get("top_match_pct", 0.0)
+    ai_score           = ai_raw.get("score", 0.0)
+
+    # ── STAGE 3: Sentence mapping ─────────────────────────────────────────────
+    task_self.update_state(
+        state="PROGRESS",
+        meta={"progress": 65, "stage": "Mapping sentences to sources"},
+    )
+    web_source_texts: List[str] = []
+    web_source_urls:  List[str] = []
+
+    for url in web_search_result.get("urls", [])[:5]:
+        try:
+            src_text = await asyncio.to_thread(_fetch_url_text, url)
+            if src_text and len(src_text.strip()) > 100:
+                web_source_texts.append(src_text)
+                web_source_urls.append(url)
+        except Exception as e:
+            logger.debug("[doc=%d] Could not fetch %s: %s", document_id, url, e)
+
+    sentence_source_map: Dict[str, int] = {}
     try:
-        import requests
-        from bs4 import BeautifulSoup
-        
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Academic Research Bot)'
-        }
-        
-        response = requests.get(url, headers=headers, timeout=timeout)
-        response.raise_for_status()
-        
-        # Parse HTML
-        soup = BeautifulSoup(response.content, 'html.parser')
-        
-        # Remove script and style elements
-        for script in soup(["script", "style"]):
-            script.decompose()
-        
-        # Get text
-        text = soup.get_text()
-        
-        # Clean up whitespace
-        lines = (line.strip() for line in text.splitlines())
-        chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
-        text = ' '.join(chunk for chunk in chunks if chunk)
-        
-        return text if text else None
-    
+        if web_source_texts:
+            sentence_source_map = await compute_sentence_source_map(
+                text, web_source_texts, web_source_urls
+            )
     except Exception as e:
-        logger.debug("Failed to fetch %s: %s", url, e)
-        return None
+        logger.exception("[doc=%d] sentence mapping failed: %s", document_id, e)
+
+    # ── STAGE 4: CommonCrawl + final scores ───────────────────────────────────
+    task_self.update_state(
+        state="PROGRESS",
+        meta={"progress": 80, "stage": "Computing final scores"},
+    )
+    commoncrawl_score = 0.0
+    try:
+        commoncrawl_score = await asyncio.to_thread(
+            local_plagiarism_score_with_commoncrawl, text
+        )
+    except Exception as e:
+        logger.warning("[doc=%d] commoncrawl failed: %s", document_id, e)
+
+    plagiarism_score, originality_score, final_ai, internal_score = compute_scores(
+        verbatim_web_score=verbatim_web_score,
+        commoncrawl_score=commoncrawl_score,
+        local_score=local_score,
+        ai_score=ai_score,
+    )
+    interpretation = classify_submission(final_ai, plagiarism_score)
+
+    sources = []
+    for url in web_search_result.get("urls", []):
+        match_data = web_search_result.get("matches", {}).get(url, {})
+        match_pct  = match_data.get("match_pct", 0.0)
+        if match_pct >= 0.1:
+            encoded = encode_web_source(url, match_pct)
+            if encoded:
+                sources.append(encoded)
+    if local_score > 0.1:
+        sources.append("local_db::internal_database")
+
+    # ── STAGE 5: Persist ──────────────────────────────────────────────────────
+    task_self.update_state(
+        state="PROGRESS",
+        meta={"progress": 90, "stage": "Storing results"},
+    )
+    end             = dt.utcnow()
+    processing_time = (end - start).total_seconds()
+
+    result_obj = AnalysisResult(
+        document_id=document_id,
+        analyzed_by=user_id,
+        ai_detected_percentage=final_ai,
+        web_source_percentage=plagiarism_score,
+        local_similarity_percentage=internal_score,
+        human_written_percentage=originality_score,
+        analysis_summary=interpretation["verdict"],
+        analysis_date=end,
+        matched_web_sources=sources,
+        sentence_source_map=sentence_source_map,
+        processing_time_seconds=processing_time,
+    )
+    await db_service.create_analysis_result(result_obj)
+
+    logger.info(
+        "[doc=%d] run_analysis_async COMPLETE | %s | risk=%s | "
+        "ai=%.1f%% plag=%.1f%% orig=%.1f%% internal=%.1f%% | "
+        "sources=%d duration=%.2fs text=%d chars",
+        document_id,
+        interpretation["case"], interpretation["risk"],
+        final_ai, plagiarism_score, originality_score, internal_score,
+        len(sources), processing_time, len(extracted_text),
+    )
+
+    return {
+        "document_id": document_id,
+        "status": "completed",
+        "scores": {
+            "ai":          final_ai,
+            "plagiarism":  plagiarism_score,
+            "originality": originality_score,
+            "internal":    internal_score,
+        },
+        "processing_time": processing_time,
+    }

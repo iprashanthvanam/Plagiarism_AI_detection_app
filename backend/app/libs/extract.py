@@ -1,3 +1,7 @@
+
+
+
+
 """
 Text extraction pipeline — TKREC Plagiarism Analysis System
 
@@ -755,7 +759,14 @@ async def extract_text(file_path: str, content_type: str = "") -> str:
         except Exception:
             return ""
 
-    if ext in (".docx", ".doc") or "wordprocessingml" in content_type:
+    # .doc  = Word 97-2003 binary OLE format — NOT a ZIP, python-docx cannot open it.
+    #         Route directly to binary reader; skip _extract_docx() to avoid the
+    #         noisy "There is no item named '[Content_Types].xml'" warning.
+    # .docx = Office Open XML (ZIP + XML) — python-docx handles this natively.
+    if ext == ".doc" or (content_type == "application/msword" and ext != ".docx"):
+        return _extract_doc_binary(file_path)
+
+    if ext == ".docx" or "wordprocessingml" in content_type:
         return _extract_docx(file_path)
 
     if ext in (".xls", ".xlsx") or "spreadsheet" in content_type.lower():

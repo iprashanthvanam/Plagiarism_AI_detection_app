@@ -1,3 +1,9 @@
+
+
+
+
+
+
 """
 main.py — TKREC Plagiarism Analysis API  v3
 
@@ -125,7 +131,7 @@ from app.libs.models import AnalysisResult
 from slowapi.errors import RateLimitExceeded
 from app.core.limitter import limiter
 from app.core.celery_client import celery_app
-from app.tasks import run_analysis
+from app.tasks import run_analysis, process_document_task
 from app.api.student import router as student_router
 
 load_dotenv()
@@ -633,6 +639,107 @@ async def upload_file(request: Request, file: UploadFile = File(...), user=Depen
         )
 
     return {"success": True, "document_id": doc["id"]}
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# BATCH UPLOAD — accept N files, save to disk, enqueue one Celery task
+# per file, return all document_ids immediately (no blocking extraction).
+#
+# Flow:
+#   POST /upload-batch  (FormData with multiple "files" fields)
+#     → for each file:
+#         ① validate MIME + size
+#         ② save raw bytes to disk
+#         ③ create_document() in DB  (metadata only — no text yet)
+#         ④ process_document_task.delay(doc_id, user_id)  → Redis queue
+#     → return { document_ids: [25, 26, 27] }  ← INSTANT
+#
+# Redis queue now has:
+#   [process_document(25), process_document(26), process_document(27)]
+#
+# Celery workers pick them up simultaneously.  Each worker:
+#   ① extract_text()
+#   ② store_extracted_text()
+#   ③ PARALLEL: local_plagiarism + web_search + AI detection
+#   ④ save AnalysisResult
+#
+# Frontend polls /analysis-status/{doc_id} for each returned id.
+# ═══════════════════════════════════════════════════════════════════════
+
+@app.post("/upload-batch")
+@limiter.limit(RATE_LIMIT_UPLOAD)
+async def upload_batch(
+    request: Request,
+    files: List[UploadFile] = File(...),
+    user=Depends(get_current_user),
+):
+    """
+    Batch file upload.  Accepts 1-N files in a single multipart request.
+    Saves files to disk, creates DB records, enqueues a Celery
+    process_document_task for every file, and returns all document_ids
+    immediately — no blocking extraction inside the HTTP request.
+    """
+    if not files:
+        raise HTTPException(400, "No files provided")
+
+    document_ids: List[int] = []
+
+    for file in files:
+        content = await file.read()
+
+        if len(content) > MAX_FILE_SIZE:
+            raise HTTPException(
+                413,
+                f"File '{file.filename}' exceeds limit "
+                f"({MAX_FILE_SIZE // 1024 // 1024}MB).",
+            )
+
+        mime = magic.from_buffer(content, mime=True)
+        if mime not in ALLOWED_MIMES:
+            raise HTTPException(
+                400,
+                f"File '{file.filename}' has disallowed type: {mime}",
+            )
+
+        ext       = os.path.splitext(file.filename)[1].lower()
+        uid       = str(uuid.uuid4())
+        file_path = os.path.join(STORAGE_DIR, f"{uid}{ext}")
+
+        with open(file_path, "wb") as f:
+            f.write(content)
+
+        doc = await db_service.create_document(
+            user_id=user["id"],
+            file_name=file.filename,
+            content_type=file.content_type,
+            size=len(content),
+            file_path=file_path,
+        )
+        doc_id = doc["id"]
+
+        task = process_document_task.delay(doc_id, user["id"])
+
+        try:
+            await db_service.store_task_id(doc_id, task.id)
+        except Exception:
+            pass
+
+        document_ids.append(doc_id)
+
+        logger.info(
+            "upload-batch: queued doc_id=%d task_id=%s file=%s user=%s",
+            doc_id, task.id, file.filename, user["id"],
+        )
+
+    return {
+        "success":      True,
+        "document_ids": document_ids,
+        "queued":       len(document_ids),
+        "message":      (
+            f"{len(document_ids)} file(s) queued for processing. "
+            "Poll /analysis-status/{document_id} for each id."
+        ),
+    }
 
 
 # ═══════════════════════════════════════════════════════════════════════
